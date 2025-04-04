@@ -1,0 +1,1263 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+    <link rel="icon" href="data:;base64,=">
+    <title>Vivoh WebTransport HLS Player</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .mainContainer {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .url-input {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .video-container {
+            margin: 20px 0;
+            background: #000;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+        .video-logo {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            width: 100px;
+            opacity: 0.8;
+        }
+        .centeredVideo {
+            width: 100%;
+            margin: 0 auto;
+            display: block;
+        }
+        .logcatBox {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+            background: #f8f9fa;
+            height: 200px;
+            overflow-y: auto;
+            text-align: left;
+            margin-top: 20px;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        .btn {
+            background-color: #1e88e5;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 10px;
+            transition: background-color 0.3s;
+        }
+        .btn:hover {
+            background-color: #1565c0;
+        }
+        .btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        input[type="text"] {
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            width: 80%;
+            font-size: 16px;
+        }
+        label {
+            font-weight: bold;
+            white-space: nowrap;
+        }
+        .status-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin: 10px 0;
+        }
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .status-label {
+            font-weight: bold;
+        }
+        .status-badge {
+            background-color: #f0f0f0;
+            padding: 5px 10px;
+            border-radius: 12px;
+            font-size: 14px;
+        }
+        .status-connected {
+            background-color: #4caf50;
+            color: white;
+        }
+        .status-disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+        .status-buffering {
+            background-color: #ff9800;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="mainContainer">
+        <img src="vivoh.png" class="video-logo" alt="Video Logo">
+        <div class="url-input">
+            <label for="wtUrl">WebTransport URL:</label>
+            <input id="wtUrl" type="text" value="https://va01.wtmpeg.com/live" style="width: 70%; padding: 10px;">
+        </div>
+        <div class="video-container">
+            <video id="videoElement" class="centeredVideo" controls playsinline>
+                Your browser is too old which doesn't support HTML5 video.
+            </video>
+        </div>
+        <div class="status-container">
+            <div class="status-indicator">
+                <span class="status-label">Connection:</span>
+                <span id="connectionStatus" class="status-badge status-disconnected">Disconnected</span>
+            </div>
+            <div class="status-indicator">
+                <span class="status-label">HLS Fragments:</span>
+                <span id="bufferStatus" class="status-badge">0 fragments</span>
+            </div>
+            <div class="status-indicator">
+                <span class="status-label">Player:</span>
+                <span id="playerStatus" class="status-badge">Idle</span>
+            </div>
+            <div class="status-indicator">
+                <span class="status-label">QUIC Streams:</span>
+                <span id="streamCounter" class="status-badge">0</span>
+            </div>
+            <div class="status-indicator">
+                <span class="status-label">Media Packets:</span>
+                <span id="packetCounter" class="status-badge">0</span>
+            </div>
+        </div>
+        <div class="controls">
+            <button id="connectButton" class="btn">Connect</button>
+            <button id="playButton" class="btn" disabled>Play</button>
+            <button id="disconnectButton" class="btn" disabled>Disconnect</button>
+        </div>
+        <textarea id="logcatbox" class="logcatBox" rows="10" readonly></textarea>
+    </div>
+
+    <script src="hls.js"></script>
+    <script>
+
+
+// Global variables
+let transport = null;
+let packetHandler = null;
+let statusInterval = null;
+let player = null;
+let playerState = 'idle';
+let disconnectionRequested = false;
+let activeReaders = [];
+let xhrInterceptionEnabled = false;
+let streamCounter = 0;
+let bufferLoggingIntervals = [];
+
+/**
+ * WebTransportHLSPacketHandler class
+ * 
+ * Processes incoming media data from WebTransport and makes it available for HLS.js
+ */
+class WebTransportHLSPacketHandler {
+    constructor() {
+        // Media buffers by track type
+        this.buffer = {
+            video: {}, // Map of packetId -> fragment data
+            audio: {}  // Map of packetId -> fragment data
+        };
+        
+        // Initialization segments
+        this.init = {
+            video: null,
+            audio: null
+        };
+        
+        // HLS manifest content
+        this.hlsData = null;
+        this.hlsUrl = '/vivoh.m3u8';
+        
+        // Track-specific buffers with metadata
+        this.trackBuffers = {
+            0: {  // Video track
+                fragments: [],
+                lastSequence: -1
+            },
+            1: {  // Audio track
+                fragments: [],
+                lastSequence: -1
+            }
+        };
+        
+        // Statistics and state
+        this.bytesReceived = 0;
+        this.fragmentsReceived = 0;
+        this.packetsReceived = 0;
+        this.lastProcessedPacketId = -1;
+        this.isDisconnected = false;
+        
+        // Event callback
+        this.onHLSReady = null;
+    }
+    
+    /**
+     * Process a WebTransport Media Packet
+     * 
+     * @param {Uint8Array|ArrayBuffer} data - The packet data
+     * @returns {boolean} - Whether processing was successful
+     */
+    processWMPPacket(data) {
+        try {
+            // Convert data to Uint8Array if needed
+            const dataArray = this._ensureUint8Array(data);
+            
+            // Validate minimum packet size
+            if (dataArray.length < 36) {
+                log(`⚠️ Packet too small: ${dataArray.length} bytes (minimum 36 required)`);
+                return false;
+            }
+            
+            // Parse the header and get fields
+            const {
+                packetId,
+                timestamp,
+                duration,
+                fields
+            } = this._extractPacketHeader(dataArray);
+            
+            // Check for duplicate packets
+            if (packetId === this.lastProcessedPacketId) {
+                log(`🔄 Duplicate packet ID: ${packetId}, ignoring`);
+                return true;
+            }
+            
+            // Update tracking stats
+            this.lastProcessedPacketId = packetId;
+            this.packetsReceived++;
+            
+            // Extract manifest data (using MPD field for HLS data)
+            if (!this.hlsData && fields.mpd.byteLength > 0) {
+                this._processHLSData(fields.mpd);
+            }
+            
+            // Extract initialization segments
+            if (!this.init.audio && fields.audioInit.byteLength > 0) {
+                this.init.audio = fields.audioInit;
+                log(`✅ Extracted audio init segment (${fields.audioInit.byteLength} bytes)`);
+            }
+            
+            if (!this.init.video && fields.videoInit.byteLength > 0) {
+                this.init.video = fields.videoInit;
+                log(`✅ Extracted video init segment (${fields.videoInit.byteLength} bytes)`);
+            }
+            
+            // Process media fragments
+            if (fields.audioData.byteLength > 0) {
+                this._processMediaFragment(1, packetId, fields.audioData, false);
+            }
+            
+            if (fields.videoData.byteLength > 0) {
+                this._processMediaFragment(0, packetId, fields.videoData, true);
+            }
+            
+            // Log periodic stats
+            if (this.packetsReceived % 10 === 0) {
+                const tsSeconds = Number(timestamp) / 1000000; // Convert microseconds to seconds
+                log(`📈 Packet stats: Received=${this.packetsReceived}, ` +
+                    `TS=${tsSeconds.toFixed(3)}s, Duration=${duration}ms, ` +
+                    `Buffer size: V=${Object.keys(this.buffer.video).length}, ` +
+                    `A=${Object.keys(this.buffer.audio).length}`);
+            }
+            
+            // Update stats
+            this.fragmentsReceived += 2; // Audio and video
+            this.bytesReceived += dataArray.byteLength;
+            
+            // Check if we have enough data to start playback
+            this._checkPlaybackReadiness();
+            
+            return true;
+        } catch (error) {
+            log(`❌ Error processing packet: ${error.message}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Convert incoming data to Uint8Array
+     * 
+     * @param {Uint8Array|ArrayBuffer|object} data - The input data
+     * @returns {Uint8Array} - Normalized data as Uint8Array
+     * @private
+     */
+    _ensureUint8Array(data) {
+        if (data instanceof ArrayBuffer) {
+            return new Uint8Array(data);
+        } else if (data instanceof Uint8Array) {
+            return data;
+        } else if (data && typeof data === 'object' && 'buffer' in data) {
+            // Handle Node.js Buffer or similar buffer-view objects
+            return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+        } else {
+            throw new Error(`Invalid data type for packet: ${typeof data}`);
+        }
+    }
+
+    /**
+ * WebTransport HLS.js Player - Part 2: Media Processing
+ */
+
+// Continue WebTransportHLSPacketHandler class methods
+WebTransportHLSPacketHandler.prototype._extractPacketHeader = function(dataArray) {
+    const view = new DataView(dataArray.buffer, dataArray.byteOffset, dataArray.byteLength);
+    
+    // Extract header fields
+    const packetId = view.getUint32(0);
+    const timestamp = view.getBigUint64(4);
+    const duration = view.getUint32(12);
+    
+    // Extract field lengths
+    const mpdLength = view.getUint32(16);
+    const audioInitLength = view.getUint32(20);
+    const videoInitLength = view.getUint32(24);
+    const audioDataLength = view.getUint32(28);
+    const videoDataLength = view.getUint32(32);
+    
+    // Calculate field positions
+    let position = 36;  // Start after header and field lengths
+    
+    // Extract each field
+    const mpd = dataArray.slice(position, position + mpdLength);
+    position += mpdLength;
+    
+    const audioInit = dataArray.slice(position, position + audioInitLength);
+    position += audioInitLength;
+    
+    const videoInit = dataArray.slice(position, position + videoInitLength);
+    position += videoInitLength;
+    
+    const audioData = dataArray.slice(position, position + audioDataLength);
+    position += audioDataLength;
+    
+    const videoData = dataArray.slice(position, position + videoDataLength);
+    
+    return {
+        packetId,
+        timestamp,
+        duration,
+        fields: {
+            mpd,
+            audioInit,
+            videoInit,
+            audioData,
+            videoData
+        }
+    };
+};
+
+WebTransportHLSPacketHandler.prototype._processHLSData = function(data) {
+    if (data.byteLength === 0) return;
+    
+    try {
+        // Convert the binary data to a string
+        const hlsString = new TextDecoder().decode(data);
+        
+        // Check if this is an actual HLS manifest
+        if (hlsString.includes('#EXTM3U')) {
+            this.hlsData = hlsString;
+            log(`📄 Extracted HLS manifest (${data.byteLength} bytes)`);
+        } else {
+            // If it's not a valid HLS manifest, we'll need to generate one
+            log(`⚠️ MPD field doesn't contain a valid HLS manifest`);
+            this._generateHLSManifest();
+            return;
+        }
+        
+        // Create a Blob URL for the HLS if needed
+        if (typeof URL !== 'undefined' && URL.createObjectURL) {
+            const blob = new Blob([this.hlsData], { type: 'application/vnd.apple.mpegurl' });
+            this.hlsUrl = URL.createObjectURL(blob);
+            log(`🔗 Created HLS blob URL: ${this.hlsUrl}`);
+            
+            // Register the HLS blob URL 
+            if (typeof window.registerManifestBlobUrl === 'function') {
+                window.registerManifestBlobUrl(this.hlsUrl, this.hlsData);
+            }
+        }
+        
+        // Notify that the HLS is ready
+        if (typeof this.onHLSReady === 'function') {
+            this.onHLSReady(this.hlsUrl);
+        }
+    } catch (error) {
+        log(`❌ Error processing HLS data: ${error.message}`);
+    }
+};
+
+WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
+    // Create a basic master playlist
+    let masterPlaylist = '#EXTM3U\n';
+    masterPlaylist += '#EXT-X-VERSION:4\n';
+    
+    // Add audio variant
+    masterPlaylist += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,URI="audio.m3u8"\n';
+    
+    // Add video variant
+    masterPlaylist += '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="audio"\n';
+    masterPlaylist += 'video.m3u8\n';
+    
+    // Create a video media playlist
+    let videoPlaylist = '#EXTM3U\n';
+    videoPlaylist += '#EXT-X-VERSION:4\n';
+    videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
+    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:1\n';
+    
+    // Add segment entries for video
+    const videoSegments = Object.keys(this.buffer.video)
+        .sort((a, b) => parseInt(a) - parseInt(b));
+    
+    for (let i = 0; i < videoSegments.length; i++) {
+        const segId = videoSegments[i];
+        // Assume 4 second segments for simplicity
+        videoPlaylist += '#EXTINF:4.0,\n';
+        videoPlaylist += `chunk_0_${segId}.m4s\n`;
+    }
+    
+    if (videoSegments.length > 0) {
+        // Only mark as ended if we have a complete stream
+        if (this.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
+        }
+    }
+    
+    // Create an audio media playlist
+    let audioPlaylist = '#EXTM3U\n';
+    audioPlaylist += '#EXT-X-VERSION:4\n';
+    audioPlaylist += '#EXT-X-TARGETDURATION:4\n';
+    audioPlaylist += '#EXT-X-MEDIA-SEQUENCE:1\n';
+    
+    // Add segment entries for audio
+    const audioSegments = Object.keys(this.buffer.audio)
+        .sort((a, b) => parseInt(a) - parseInt(b));
+    
+    for (let i = 0; i < audioSegments.length; i++) {
+        const segId = audioSegments[i];
+        // Assume 4 second segments for simplicity
+        audioPlaylist += '#EXTINF:4.0,\n';
+        audioPlaylist += `chunk_1_${segId}.m4s\n`;
+    }
+    
+    if (audioSegments.length > 0) {
+        // Only mark as ended if we have a complete stream
+        if (this.isDisconnected) {
+            audioPlaylist += '#EXT-X-ENDLIST\n';
+        }
+    }
+    
+    // Store the generated master playlist
+    this.hlsData = masterPlaylist;
+    
+    // Create blob URLs for the playlists
+    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    const audioBlob = new Blob([audioPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    
+    this.hlsUrl = URL.createObjectURL(masterBlob);
+    
+    // Register all playlists for XHR interception
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+        window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
+        window.registerManifestBlobUrl('audio.m3u8', audioPlaylist);
+    }
+    
+    log(`✅ Generated HLS manifests and registered blob URLs`);
+    
+    // Notify that the HLS is ready
+    if (typeof this.onHLSReady === 'function') {
+        this.onHLSReady(this.hlsUrl);
+    }
+};
+
+WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
+    // Only update occasionally to avoid excessive regeneration
+    if (Math.random() > 0.2) return; // Only update ~20% of the time
+    
+    // Generate new manifests with updated segment lists
+    this._generateHLSManifest();
+    log(`🔄 Updated HLS manifests with new fragments`);
+};
+
+WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId, packetId, mediaData, isVideo) {
+    const trackType = isVideo ? "video" : "audio";
+    
+    // Skip empty fragments
+    if (mediaData.byteLength === 0) {
+        return;
+    }
+    
+    // Enhanced fragment validation
+    if (mediaData.byteLength < 8) {
+        log(`⚠️ Fragment too small: ${mediaData.byteLength} bytes (minimum 8 required)`);
+        return;
+    }
+    
+    // Log the box type for debugging (first 4 bytes = size, next 4 = type)
+    if (mediaData.byteLength >= 8) {
+        const boxType = String.fromCharCode(
+            mediaData[4], mediaData[5], mediaData[6], mediaData[7]
+        );
+        
+        if (packetId % 10 === 0) {
+            log(`🧪 Fragment ${packetId} (${trackType}) starts with box: ${boxType}`);
+        }
+    }
+    
+    // Add fragment to buffer with proper indexing
+    this.buffer[trackType][packetId] = mediaData;
+    
+    // Also add to track-specific buffers for better organization
+    if (!this.trackBuffers[trackId]) {
+        this.trackBuffers[trackId] = { fragments: [], lastSequence: -1 };
+    }
+    
+    // Add to fragments array with sequence info
+    this.trackBuffers[trackId].fragments.push({
+        sequence: packetId,
+        data: mediaData,
+        isKeyframe: isVideo, // For simplicity, treat all video fragments as keyframes
+        timestamp: Date.now()
+    });
+    
+    // Register the media segment in the XHR interception map if available
+    if (typeof window.registerMediaSegment === 'function') {
+        window.registerMediaSegment(trackId, packetId, mediaData);
+    }
+    
+    // Log fragment details for video (less frequently for audio to reduce log spam)
+    if (isVideo && packetId % 10 === 0) {
+        log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B`);
+    }
+    
+    // Keep buffer size reasonable (keep last 30 fragments)
+    if (this.trackBuffers[trackId].fragments.length > 30) {
+        this.trackBuffers[trackId].fragments.sort((a, b) => a.sequence - b.sequence);
+        this.trackBuffers[trackId].fragments = this.trackBuffers[trackId].fragments.slice(-30);
+        
+        // Also clean up the main buffer
+        const oldKeys = Object.keys(this.buffer[trackType])
+            .map(Number)
+            .sort((a, b) => a - b)
+            .slice(0, -30);
+            
+        for (const key of oldKeys) {
+            delete this.buffer[trackType][key];
+        }
+    }
+    
+    // Update last sequence
+    this.trackBuffers[trackId].lastSequence = Math.max(
+        this.trackBuffers[trackId].lastSequence, 
+        packetId
+    );
+    
+    // Update HLS manifest if needed (when we get new fragments)
+    if (this.hlsData && (this.trackBuffers[0].fragments.length > 3 || this.trackBuffers[1].fragments.length > 3)) {
+        this._updateHLSManifest();
+    }
+    
+    // Regenerate HLS manifests if needed
+    if (!this.hlsData && this.trackBuffers[0].fragments.length >= 3 && this.trackBuffers[1].fragments.length >= 3) {
+        this._generateHLSManifest();
+    }
+};
+/**
+ * WebTransport HLS.js Player - Part 3: HLS.js Integration
+ */
+
+// Complete WebTransportHLSPacketHandler methods
+WebTransportHLSPacketHandler.prototype._checkPlaybackReadiness = function() {
+    // If player already exists, don't create another one
+    if (window.player) {
+        return;
+    }
+    
+    // Check if we have initialization segments and HLS data
+    const hasVideoInit = this.init.video !== null;
+    const hasAudioInit = this.init.audio !== null;
+    const hasHLS = this.hlsData !== null;
+    
+    // Check if we have enough fragments
+    const videoCount = Object.keys(this.buffer.video).length;
+    const audioCount = Object.keys(this.buffer.audio).length;
+    
+    // Wait until we have enough data to start playback
+    if (hasVideoInit && hasAudioInit && hasHLS && videoCount >= 3 && audioCount >= 3) {
+        log(`✅ Media ready: HLS=${hasHLS}, V=${videoCount}/${hasVideoInit}, A=${audioCount}/${hasAudioInit}`);
+        
+        // Notify that we're ready to initialize the player
+        if (typeof this.onHLSReady === 'function') {
+            this.onHLSReady(this.hlsUrl);
+        }
+    } else if (!hasHLS && videoCount >= 3 && audioCount >= 3) {
+        // We have enough fragments but no HLS manifest - generate one
+        this._generateHLSManifest();
+    }
+};
+
+WebTransportHLSPacketHandler.prototype.getFragment = function(trackId, segmentId) {
+    const trackType = trackId === 0 ? "video" : "audio";
+    
+    // For initialization segments
+    if (segmentId === 0 || segmentId === -1) {
+        return this.init[trackType];
+    }
+    
+    // For media segments
+    const buffer = this.buffer[trackType];
+    
+    // Try to find exact segment ID
+    if (buffer[segmentId]) {
+        return buffer[segmentId];
+    }
+    
+    // If not found, get closest segment ID
+    const keys = Object.keys(buffer).map(Number).sort((a, b) => a - b);
+    
+    // Find closest segment (prefer newer segments)
+    if (keys.length > 0) {
+        // Sort by closeness to the requested segment ID
+        keys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId));
+        const closestId = keys[0];
+        
+        log(`⚠️ Segment #${segmentId} not found, using closest #${closestId}`);
+        return buffer[closestId];
+    }
+    
+    return null;
+};
+
+WebTransportHLSPacketHandler.prototype.getStats = function() {
+    const videoFragCount = Object.keys(this.buffer.video).length;
+    const audioFragCount = Object.keys(this.buffer.audio).length;
+    
+    return {
+        bytesReceived: this.bytesReceived,
+        audioFragments: audioFragCount,
+        videoFragments: videoFragCount,
+        fragmentsReceived: this.fragmentsReceived,
+        fragmentsAvailable: videoFragCount + audioFragCount,
+        packetsReceived: this.packetsReceived,
+        videoInitAvailable: this.init.video !== null,
+        audioInitAvailable: this.init.audio !== null,
+        hlsAvailable: this.hlsData !== null
+    };
+};
+
+WebTransportHLSPacketHandler.prototype.disconnect = function() {
+    this.isDisconnected = true;
+    log(`🧹 Cleaning up packet handler resources`);
+    
+    // Clear buffers
+    this.buffer.video = {};
+    this.buffer.audio = {};
+    
+    // Clear track-specific buffers
+    Object.keys(this.trackBuffers).forEach(trackId => {
+        this.trackBuffers[trackId].fragments = [];
+    });
+    
+    // Clear HLS data
+    if (this.hlsUrl && this.hlsUrl.startsWith('blob:')) {
+        try {
+            URL.revokeObjectURL(this.hlsUrl);
+        } catch (e) {
+            // Ignore errors during cleanup
+        }
+    }
+    
+    this.hlsData = null;
+    this.hlsUrl = '/vivoh.m3u8';
+    
+    // Clear initialization segments
+    this.init.video = null;
+    this.init.audio = null;
+};
+
+/**
+ * Set up XHR interception for HLS.js segment requests
+ */
+function setupXHRInterception() {
+    if (window.xhrInterceptionEnabled) return;
+    
+    log("🔄 Setting up XMLHttpRequest interception for HLS");
+    window.xhrInterceptionEnabled = true;
+    
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    
+    // Create a map to store blob URLs and their corresponding data
+    const blobUrlMap = new Map();
+    
+    // Add method to register manifest blob URLs
+    window.registerManifestBlobUrl = (url, manifestData) => {
+        blobUrlMap.set(url, manifestData);
+        log(`📄 Registered manifest blob URL: ${url}`);
+    };
+    
+    // Add method to register media segments
+    window.registerMediaSegment = (trackId, segmentId, data) => {
+        const key = `segment-${trackId}-${segmentId}`;
+        blobUrlMap.set(key, data);
+    };
+    
+    // Override open method to track request type
+    XMLHttpRequest.prototype.open = function(method, url, async) {
+        this._url = url;
+        this._method = method;
+        
+        if (method === 'GET' && typeof url === 'string') {
+            log(`🔍 XHR Request: ${method} ${url}`);
+        }
+        
+        // Track request type
+        if (typeof url === 'string') {
+            // Blob URLs for manifests we've registered
+            if (url.startsWith('blob:') && blobUrlMap.has(url)) {
+                this._isManifestBlobUrl = true;
+                log(`📄 Recognized manifest blob URL: ${url}`);
+            }
+            // HLS manifest (.m3u8) requests
+            else if (url.includes('.m3u8')) {
+                this._isManifestRequest = true;
+                log(`📄 HLS manifest request detected: ${url}`);
+            } 
+            // Init segment requests
+            else if (url.includes('init_') || url.includes('init-')) {
+                this._isInitSegment = true;
+                
+                // Extract track ID from URL pattern
+                const match = url.match(/init[_-](\d+)\.mp4/) || url.match(/init[_-](\w+)\.mp4/);
+                if (match) {
+                    this._trackId = match[1] === 'video' ? 0 : (match[1] === 'audio' ? 1 : parseInt(match[1]));
+                    log(`🔑 Init segment request for track ${this._trackId}`);
+                }
+            } 
+            // Media segment requests
+            else if (url.match(/segment[_-]\d+[_-]\d+\.m4s/) || url.match(/chunk[_-]\d+[_-]\d+\.m4s/)) {
+                this._isMediaSegment = true;
+                
+                // Extract track and segment IDs from various URL patterns
+                let match = url.match(/segment[_-](\d+)[_-](\d+)\.m4s/) || 
+                           url.match(/chunk[_-](\d+)[_-](\d+)\.m4s/);
+                
+                if (match) {
+                    this._trackId = parseInt(match[1]);
+                    this._segmentId = parseInt(match[2]);
+                    log(`🎬 Media segment request: track=${this._trackId}, segment=${this._segmentId}`);
+                }
+            }
+            // External requests - don't intercept
+            else if (url.includes('time.akamai.com') || url.includes('/api/')) {
+                this._isExternalRequest = true;
+            }
+        }
+        
+        originalXHROpen.call(this, method, url, async !== false);
+    };
+    
+    // Override send method to serve content from our buffer
+    XMLHttpRequest.prototype.send = function(body) {
+        // External requests - always pass through
+        if (this._isExternalRequest) {
+            originalXHRSend.call(this, body);
+            return;
+        }
+        
+        // Manifest Blob URL Request - serve from our map
+        if (this._isManifestBlobUrl && blobUrlMap.has(this._url)) {
+            log(`📄 Serving registered manifest blob from map (${this._url})`);
+            
+            const manifestData = blobUrlMap.get(this._url);
+            
+            setTimeout(() => {
+                this.responseType = 'text';
+                Object.defineProperty(this, 'response', { get: () => manifestData });
+                Object.defineProperty(this, 'responseText', { get: () => manifestData });
+                Object.defineProperty(this, 'status', { get: () => 200 });
+                Object.defineProperty(this, 'statusText', { get: () => 'OK' });
+                Object.defineProperty(this, 'readyState', { get: () => 4 });
+                
+                this.dispatchEvent(new Event('readystatechange'));
+                this.dispatchEvent(new Event('load'));
+                this.dispatchEvent(new Event('loadend'));
+                
+                log(`✅ Blob manifest served successfully`);
+            }, 10);
+            
+            return;
+        }
+        
+        // HLS Manifest Request
+        if (this._isManifestRequest && window.packetHandler?.hlsData) {
+            log(`📄 Serving HLS manifest from WebTransport packet (${window.packetHandler.hlsData.length} bytes)`);
+            
+            setTimeout(() => {
+                this.responseType = 'text';
+                Object.defineProperty(this, 'response', { get: () => window.packetHandler.hlsData });
+                Object.defineProperty(this, 'responseText', { get: () => window.packetHandler.hlsData });
+                Object.defineProperty(this, 'status', { get: () => 200 });
+                Object.defineProperty(this, 'statusText', { get: () => 'OK' });
+                Object.defineProperty(this, 'readyState', { get: () => 4 });
+                
+                this.dispatchEvent(new Event('readystatechange'));
+                this.dispatchEvent(new Event('load'));
+                this.dispatchEvent(new Event('loadend'));
+                
+                log(`✅ HLS manifest served successfully`);
+            }, 10);
+            
+            return;
+        }
+        
+        // Init Segment Request
+        if (this._isInitSegment && typeof this._trackId !== 'undefined') {
+            const trackId = this._trackId;
+            const trackType = trackId === 0 ? "video" : "audio";
+            
+            // Check if we have an init segment for this track
+            if (window.packetHandler?.init[trackType]) {
+                const initData = window.packetHandler.init[trackType];
+                log(`🔑 Serving ${trackType} init segment (${initData.byteLength} bytes)`);
+                
+                setTimeout(() => {
+                    // Make sure we're using the correct responseType
+                    this.responseType = 'arraybuffer';
+                    
+                    // Make sure we're serving an ArrayBuffer, not a TypedArray
+                    let buffer;
+                    if (initData instanceof Uint8Array) {
+                        buffer = initData.buffer.slice(
+                            initData.byteOffset, 
+                            initData.byteOffset + initData.byteLength
+                        );
+                    } else {
+                        buffer = initData;
+                    }
+                    
+                    // Set the correct response properties
+                    Object.defineProperty(this, 'response', { get: () => buffer });
+                    Object.defineProperty(this, 'status', { get: () => 200 });
+                    Object.defineProperty(this, 'statusText', { get: () => 'OK' });
+                    Object.defineProperty(this, 'readyState', { get: () => 4 });
+                    
+                    // Dispatch events to signal completion
+                    this.dispatchEvent(new Event('readystatechange'));
+                    this.dispatchEvent(new Event('load'));
+                    this.dispatchEvent(new Event('loadend'));
+                    
+                    log(`✅ Init segment served: track=${trackId}`);
+                }, 10);
+                
+                return;
+            } else {
+                log(`⚠️ No init segment available for track ${trackId}`);
+            }
+        }
+        
+        // Media Segment Request
+        if (this._isMediaSegment && typeof this._trackId !== 'undefined' && typeof this._segmentId !== 'undefined') {
+            const trackId = this._trackId;
+            const segmentId = this._segmentId;
+            const trackType = trackId === 0 ? "video" : "audio";
+            
+            // Try to get segment from packetHandler
+            let segmentData = null;
+            
+            // First check if exact segment exists in buffer
+            if (window.packetHandler && window.packetHandler.buffer[trackType][segmentId]) {
+                segmentData = window.packetHandler.buffer[trackType][segmentId];
+                log(`🎬 Found exact segment: track=${trackId}, segment=${segmentId}`);
+            } 
+            // If not, try to find a segment close to the requested one
+            else if (window.packetHandler) {
+                const buffer = window.packetHandler.buffer[trackType];
+                const keys = Object.keys(buffer).map(Number).sort((a, b) => a - b);
+                
+                if (keys.length > 0) {
+                    // Try to find closest segment - better to use newer segments
+                    const closerKeys = keys.filter(k => Math.abs(k - segmentId) < 10);
+                    
+                    if (closerKeys.length > 0) {
+                        const closestId = closerKeys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId))[0];
+                        log(`🔄 Using closest segment: ${trackType} #${closestId} instead of #${segmentId}`);
+                        segmentData = buffer[closestId];
+                    } else {
+                        // Default to most recent segment
+                        const latestKey = keys[keys.length - 1];
+                        log(`🔄 Using latest segment: ${trackType} #${latestKey} instead of #${segmentId}`);
+                        segmentData = buffer[latestKey];
+                    }
+                }
+            }
+            
+            if (segmentData) {
+                log(`🎬 Serving segment: track=${trackId}, segment=${segmentId} (${segmentData.byteLength} bytes)`);
+                
+                setTimeout(() => {
+                    // IMPORTANT: Ensure using correct responseType
+                    this.responseType = 'arraybuffer';
+                    
+                    // Make sure we're serving an ArrayBuffer, not a TypedArray
+                    let buffer;
+                    if (segmentData instanceof Uint8Array) {
+                        buffer = segmentData.buffer.slice(
+                            segmentData.byteOffset, 
+                            segmentData.byteOffset + segmentData.byteLength
+                        );
+                    } else {
+                        buffer = segmentData;
+                    }
+                    
+                    // Set the correct response properties
+                    Object.defineProperty(this, 'response', { get: () => buffer });
+                    Object.defineProperty(this, 'status', { get: () => 200 });
+                    Object.defineProperty(this, 'statusText', { get: () => 'OK' });
+                    Object.defineProperty(this, 'readyState', { get: () => 4 });
+                    
+                    // Dispatch events to signal completion
+                    this.dispatchEvent(new Event('readystatechange'));
+                    this.dispatchEvent(new Event('load'));
+                    this.dispatchEvent(new Event('loadend'));
+                    
+                    log(`✅ Media segment served: track=${trackId}, segment=${segmentId}`);
+                }, 10);
+                
+                return;
+            } else {
+                log(`⚠️ No media segment available for track=${trackId}, segment=${segmentId}`);
+                // Respond with 404 to allow hls.js to retry
+                setTimeout(() => {
+                    Object.defineProperty(this, 'status', { get: () => 404 });
+                    Object.defineProperty(this, 'statusText', { get: () => 'Not Found' });
+                    Object.defineProperty(this, 'readyState', { get: () => 4 });
+                    
+                    this.dispatchEvent(new Event('readystatechange'));
+                    this.dispatchEvent(new Event('load'));
+                    this.dispatchEvent(new Event('loadend'));
+                }, 10);
+                
+                return;
+            }
+        }
+        
+        // Fall back to original XHR behavior for any unhandled requests
+        originalXHRSend.call(this, body);
+    };
+    
+    log(`✅ XHR interception setup completed for HLS.js`);
+    return true;
+}
+
+/**
+ * Initialize HLS.js player with WebTransport stream data
+ * 
+ * @param {string} hlsUrl - URL to the HLS manifest (can be a blob URL)
+ * @returns {object} - The configured HLS.js player instance
+ */
+function setupHLSPlayer(hlsUrl = '/vivoh.m3u8') {
+    if (window.player) {
+        log(`📝 Player already exists, skipping creation`);
+        return window.player;
+    }
+
+    try {
+        log(`🎬 Creating HLS.js player (URL: ${hlsUrl})`);
+        
+        // Ensure video element exists
+        const videoElement = document.getElementById('videoElement');
+        if (!videoElement) {
+            log(`❌ Video element not found`);
+            return null;
+        }
+        
+        // Check if HLS.js is supported
+        if (!Hls.isSupported()) {
+            log(`❌ HLS.js is not supported in this browser`);
+            alert('HLS.js is not supported in this browser. Please use a modern browser.');
+            return null;
+        }
+        
+        // Create new HLS.js player
+        window.player = new Hls({
+            // Core configuration
+            debug: false,
+            enableWorker: true,
+            lowLatencyMode: true,
+            
+            // Buffer configuration (more permissive than default)
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            maxBufferSize: 60 * 1000 * 1000, // 60MB
+            maxBufferHole: 0.5,
+            
+            // Media configuration
+            appendErrorMaxRetry: 3,
+            
+            // Segment loading
+            fragLoadingMaxRetry: 4,
+            fragLoadingRetryDelay: 500,
+            
+            // Error recovery
+            recoverMediaError: true,
+            recoverNetworkError: true
+        });
+        
+        // Set up event handlers
+        window.player.on(Hls.Events.MEDIA_ATTACHED, () => {
+            log(`🎬 HLS.js attached to media element`);
+            window.player.loadSource(hlsUrl);
+        });
+        
+        window.player.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+            log(`📄 HLS manifest parsed: ${data.levels.length} quality levels`);
+            window.playerState = 'ready';
+            updateUI();
+            
+            // Enable play button once manifest is parsed
+            const playBtn = document.getElementById('playButton');
+            if (playBtn) {
+                playBtn.disabled = false;
+            }
+        });
+        
+        // Add detailed error handling
+        window.player.on(Hls.Events.ERROR, (event, data) => {
+            // Log all errors 
+            log(`❌ HLS.js error: ${data.type} - ${data.details}`);
+            
+            if (data.fatal) {
+                log(`⚠️ Fatal error: ${data.details}`);
+                
+                switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        // Try to recover network error
+                        log(`🔄 Attempting to recover from network error`);
+                        window.player.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        // Try to recover media error
+                        log(`🔄 Attempting to recover from media error`);
+                        window.player.recoverMediaError();
+                        break;
+                    default:
+                        // Cannot recover from other fatal errors
+                        log(`❌ Cannot recover from error`);
+                        window.playerState = 'error';
+                        updateUI();
+                        break;
+                }
+            }
+        });
+        
+        // Add buffer monitoring
+        window.player.on(Hls.Events.BUFFER_APPENDED, (event, data) => {
+            log(`📊 Buffer appended: ${data.type}, ${data.frag.duration.toFixed(2)}s`);
+        });
+        
+        window.player.on(Hls.Events.FRAG_LOADED, (event, data) => {
+            log(`📦 Fragment loaded: ${data.frag.type}, ${data.frag.duration.toFixed(2)}s, ${data.frag.url}`);
+        });
+        
+        // Player state transitions
+        videoElement.addEventListener('playing', () => {
+            log(`▶️ Playback started`);
+            window.playerState = 'playing';
+            updateUI();
+        });
+        
+        videoElement.addEventListener('pause', () => {
+            log(`⏸️ Playback paused`);
+            if (window.playerState !== 'error') {
+                window.playerState = 'paused';
+                updateUI();
+            }
+        });
+        
+        videoElement.addEventListener('waiting', () => {
+            log(`⏳ Playback waiting (buffering)`);
+            window.playerState = 'buffering';
+            updateUI();
+        });
+        
+        videoElement.addEventListener('error', (e) => {
+            const error = videoElement.error;
+            log(`❌ Video element error: ${error ? error.code : 'unknown'}`);
+            window.playerState = 'error';
+            updateUI();
+        });
+        
+        // Attach player to video element
+        window.player.attachMedia(videoElement);
+        
+        // Set up periodic buffer level monitoring
+        if (window.bufferMonitorInterval) {
+            clearInterval(window.bufferMonitorInterval);
+        }
+        
+        window.bufferMonitorInterval = setInterval(() => {
+            if (!window.player) {
+                clearInterval(window.bufferMonitorInterval);
+                return;
+            }
+            
+            try {
+                // Log buffer info
+                const bufferInfo = window.player.levels && window.player.levels.length > 0 
+                    ? `${(window.player.media.buffered.length ? window.player.media.buffered.end(0) - window.player.media.currentTime : 0).toFixed(1)}s` 
+                    : '0s';
+                
+                // Only log when important (not every interval)
+                if (window.playerState === 'buffering' || Math.random() < 0.2) {
+                    log(`📊 Buffer: ${bufferInfo}`);
+                }
+            } catch (e) {
+                // Ignore errors during buffer monitoring
+            }
+        }, 5000);
+        
+        log(`✅ HLS.js player initialized with URL: ${hlsUrl}`);
+        return window.player;
+    } catch (error) {
+        log(`❌ Error creating HLS.js player: ${error.message}`);
+        window.playerState = 'error';
+        updateUI();
+        return null;
+    }
+}
+
+/**
+ * Setup WebTransport connection and handlers for HLS
+ * 
+ * @param {string} url - WebTransport server URL
+ * @returns {WebTransportHLSPacketHandler} - The packet handler
+ */
+async function setupWebTransport(url) {
+    try {
+        window.disconnectionRequested = false;
+        
+        log(`🔍 Setting up WebTransport with URL: ${url}`);
+        
+        // Clear any existing resources
+        if (window.transport) {
+            try { 
+                window.transport.close(); 
+            } catch (e) {
+                log(`🔍 Error closing existing transport: ${e.message}`);
+            }
+            window.transport = null;
+        }
+        
+        // Initialize packet handler for HLS
+        window.packetHandler = new WebTransportHLSPacketHandler();
+        
+        // Set HLS ready callback to initialize player
+        window.packetHandler.onHLSReady = (hlsUrl) => {
+            log(`📄 HLS ready for playback: ${hlsUrl}`);
+            setupHLSPlayer(hlsUrl);
+        };
+        
+        // Setup XHR interception BEFORE creating WebTransport connection
+        setupXHRInterception();
+        
+        // Connect to WebTransport 
+        log(`🔗 Connecting to WebTransport server: ${url}`);
+        
+        const createStartTime = Date.now();
+        window.transport = new WebTransport(url);
+        const createEndTime = Date.now();
+        
+        log(`📡 WebTransport object created in ${createEndTime - createStartTime}ms`);
+        
+        // Set up connection closed handler
+        window.transport.closed.then(() => {
+            log(`ℹ️ Connection closed normally`);
+            if (!window.disconnectionRequested) {
+                handleConnectionClosed();
+            }
+        }).catch((error) => {
+            log(`❌ Connection closed with error: ${error.message}`);
+            if (!window.disconnectionRequested) {
+                handleConnectionClosed();
+            }
+        });
+        
+        // Listen for incoming streams
+        listenToIncomingStreams(window.transport, window.packetHandler).catch(err => {
+            log(`❌ Error in stream listener: ${err.message}`);
+        });
+        
+        // Start status updates
+        startStatusUpdates();
+        
+        // Update UI
+        updateUI();
+        
+        log(`✅ WebTransport setup completed successfully`);
+        
+        return window.packetHandler;
+    } catch (error) {
+        log(`❌ WebTransport error: ${error.message}`);
+        updateUI();
+        throw error;
+    }
+}
+
+/**
+ * Simple logging function that outputs to both console and UI
+ */
+function log(message) {
+    const logEl = document.getElementById('logcatbox');
+    if (!logEl) {
+        console.log(message);
+        return;
+    }
+    
+    const time = new Date().toISOString().split('T')[1].split('.')[0];
+    const formattedMessage = `[${time}] ${message}`;
+    
+    logEl.value += formattedMessage + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(message);
+}
+    </script>
+</body>
+</html>
