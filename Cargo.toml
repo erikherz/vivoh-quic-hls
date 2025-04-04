@@ -7,11 +7,11 @@ license = "Proprietary"
 description = "HLS over QUIC"
 
 [[bin]]
-name = "vqd-server"
+name = "vqh-server"
 path = "src/server.rs"
 
 [[bin]]
-name = "vqd-publisher"
+name = "vqh-publisher"
 path = "src/publisher.rs"
 
 [dependencies]
