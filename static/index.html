@@ -535,14 +535,6 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     if (typeof window.registerMediaSegment === 'function') {
         window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
     }
-
-    // Register the media segment for XHR interception
-    window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
-        // Store with both the exact name and the ID-based key
-        window.blobUrlMap.set(segmentName, data);
-        window.blobUrlMap.set(`segment-${trackId}-${segmentId}`, data);
-        log(`🔗 Registered segment: ${segmentName}`);
-    };
     
     // Log fragment details
     if (isVideo && packetId % 10 === 0) {
