@@ -16,7 +16,7 @@ Publisher Command:
 
 Encoder Command:
 ```
-ffmpeg -re -stream_loop -1 -i adena.mp4 -vf "drawtext=text='Virginia\: %{gmtime}':fontsize=48:fontcolor=white:x=24:y=24" -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 -b:v 3000k -c:a aac -b:a 128k -f hls -hls_time 1 -hls_list_size 5 -hls_flags delete_segments -hls_segment_filename "./out/chunk-%05d.ts" ./out/playlist.m3u8
+ffmpeg -re -stream_loop -1 -i adena.mp4 -vf "drawtext=text='Virginia\: %{gmtime}':fontsize=48:fontcolor=white:x=24:y=24" -c:v libx264 -preset ultrafast -tune zerolatency -g 30 -keyint_min 30 -sc_threshold 0 -b:v 3000k -c:a aac -b:a 128k -f hls -hls_time 1 -hls_list_size 5 -hls_flags delete_segments+independent_segments -hls_segment_type mpegts -force_key_frames "expr:gte(t,n_forced*1)" -hls_segment_filename "./out/chunk-%05d.ts" ./out/playlist.m3u8
 ```
 
 Experimental Pipe Input Option with GPAC:
