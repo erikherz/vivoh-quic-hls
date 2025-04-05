@@ -489,7 +489,6 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
  * @param {boolean} isVideo - Whether this is video data
  * @param {number} segmentDuration - The segment duration in seconds
  */
-
  WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId, packetId, mediaData, isVideo, segmentDuration = 1.0) {
     const trackType = isVideo ? "video" : "audio";
     
@@ -497,6 +496,16 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     if (mediaData.byteLength === 0) {
         return;
     }
+    
+    // Ensure segmentDuration is a valid number
+    if (isNaN(segmentDuration) || !isFinite(segmentDuration) || segmentDuration <= 0) {
+        // Default to 1.0 second if the duration is invalid
+        segmentDuration = 1.0;
+        log(`⚠️ Invalid segment duration for ${trackType} #${packetId}, using default: 1.0`);
+    }
+    
+    // Cap segment duration to reasonable values (between 0.1 and 10 seconds)
+    segmentDuration = Math.max(0.1, Math.min(10.0, segmentDuration));
     
     // MPEG-TS detection - check for sync byte 0x47 ('G' in ASCII)
     const isMpegTs = mediaData.byteLength > 0 && mediaData[0] === 0x47;
@@ -527,7 +536,34 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
         }
     }
     
-    // Add fragment to buffer regardless of type
+    // Use a consistent file naming convention for all segments
+    // This helps avoid issues with high-numbered segments
+    let normalizedId = packetId;
+    let segmentName = "";
+    
+    // Check if this is a sequential ID (small numeric value) or a randomly generated one
+    if (packetId < 1000000) {
+        // Regular sequential segment
+        segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
+    } else {
+        // High ID segments - might be random/generated IDs
+        // Store them with their actual ID but also give them a sequential display name
+        // to maintain proper order in the playlist
+        
+        // Find the next available sequential ID
+        const highestSeqId = Object.keys(this.buffer[trackType])
+            .filter(id => parseInt(id) < 1000000)
+            .map(id => parseInt(id))
+            .sort((a, b) => b - a)[0] || -1;
+            
+        normalizedId = highestSeqId + 1;
+        segmentName = `chunk-${normalizedId.toString().padStart(5, '0')}.ts`;
+        
+        // Log the ID mapping for debugging
+        log(`🔄 Mapping high segment ID #${packetId} to sequential ID #${normalizedId}`);
+    }
+    
+    // Store both the original data and normalized segment info
     this.buffer[trackType][packetId] = mediaData;
     
     // Add to track-specific buffers
@@ -538,36 +574,51 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     // Add to fragments array with sequence info and segment duration
     this.trackBuffers[trackId].fragments.push({
         sequence: packetId,
+        normalizedId: normalizedId,  // Store the normalized ID
         data: mediaData,
         isKeyframe: true, // For MPEG-TS segments, treat all as keyframes
         timestamp: Date.now(),
         isMpegTs: isMpegTs,
-        segmentDuration: segmentDuration // Store segment duration from packet
+        segmentDuration: segmentDuration, // Store segment duration from packet
+        segmentName: segmentName  // Store the segment name
     });
     
-    // Register the media segment for XHR interception with exact filename
-    const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
+    // Register the media segment for XHR interception with both names
     if (typeof window.registerMediaSegment === 'function') {
         window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
+        
+        // Also register with the original ID if it's different
+        if (normalizedId !== packetId) {
+            const originalSegmentName = `chunk-${packetId}.ts`;
+            window.registerMediaSegment(trackId, packetId, mediaData, originalSegmentName);
+        }
     }
     
     // Log fragment details
     if (isVideo && packetId % 10 === 0) {
-        log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B`);
+        log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B, duration=${segmentDuration.toFixed(3)}s`);
     }
     
     // Keep buffer size reasonable (keep last 30 fragments)
     if (this.trackBuffers[trackId].fragments.length > 30) {
-        this.trackBuffers[trackId].fragments.sort((a, b) => a.sequence - b.sequence);
+        this.trackBuffers[trackId].fragments.sort((a, b) => {
+            // Sort by normalized ID first (for sequential consistency)
+            // then by timestamp as fallback
+            if (a.normalizedId !== undefined && b.normalizedId !== undefined) {
+                return a.normalizedId - b.normalizedId;
+            }
+            return a.timestamp - b.timestamp;
+        });
+        
         this.trackBuffers[trackId].fragments = this.trackBuffers[trackId].fragments.slice(-30);
         
-        // Also clean up main buffer
-        const oldKeys = Object.keys(this.buffer[trackType])
+        // Also clean up main buffer, but be selective about which keys to remove
+        const keysToKeep = this.trackBuffers[trackId].fragments.map(f => f.sequence);
+        const keysToRemove = Object.keys(this.buffer[trackType])
             .map(Number)
-            .sort((a, b) => a - b)
-            .slice(0, -30);
+            .filter(key => !keysToKeep.includes(key));
             
-        for (const key of oldKeys) {
+        for (const key of keysToRemove) {
             delete this.buffer[trackType][key];
         }
     }
@@ -580,8 +631,7 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     
     // Update HLS manifest if needed
     this._updateHLSManifest();
-}
-
+};
 /**
  * WebTransport HLS.js Player - Part 3: HLS.js Integration
  */
