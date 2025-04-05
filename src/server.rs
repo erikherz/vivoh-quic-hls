@@ -168,10 +168,10 @@ async fn handle_publisher(
                             match WebTransportMediaPacket::parse(&buf) {
                                 Ok(packet) => {
                                     debug!(
-                                        "Parsed WMP #{} ({}ms, video: {} bytes)",
+                                        "Parsed WMP #{} ({}ms, av_data: {} bytes)",
                                         packet.packet_id,
                                         packet.duration,
-                                        packet.video_data.len()
+                                        packet.av_data.len()
                                     );
 
                                     let mut mgr = manager.lock().await;

@@ -317,8 +317,6 @@ fn format_timestamp(seconds: f64) -> String {
 
 struct HlsReader {
     input_dir: PathBuf,
-    audio_init: Option<Bytes>,
-    video_init: Option<Bytes>,
     packet_id: u32,
     seen_segments: HashSet<u32>,     
     seen_queue: VecDeque<u32>,       
@@ -329,26 +327,11 @@ impl HlsReader {
     async fn new(input_dir: PathBuf) -> Result<Self, VqdError> {
         Ok(Self {
             input_dir,
-            audio_init: None,
-            video_init: None,
             packet_id: 0,
             seen_segments: HashSet::new(),
             seen_queue: VecDeque::new(),
             current_timestamp: 0.0,
         })
-    }
-
-    async fn ensure_init_segments_loaded(&mut self) -> Result<bool, VqdError> {
-        // For pipe input, we can just create empty init segments if they don't exist
-        if self.audio_init.is_none() {
-            self.audio_init = Some(Bytes::from(Vec::new()));
-        }
-        if self.video_init.is_none() {
-            self.video_init = Some(Bytes::from(Vec::new()));
-        }
-        
-        // Always return true since we've ensured the init segments exist (even if empty)
-        Ok(true)
     }
 
     async fn start_reading(mut self, tx: broadcast::Sender<WebTransportMediaPacket>) -> Result<(), VqdError> {
@@ -361,25 +344,7 @@ impl HlsReader {
                 continue;
             }
             
-            // Ensure init segments are loaded
-            match self.ensure_init_segments_loaded().await {
-                Ok(true) => {
-                    // Init segments loaded successfully, continue processing
-                },
-                Ok(false) => {
-                    // No master playlist or init segments yet, wait and retry
-                    warn!("Waiting for HLS files to appear in {}...", self.input_dir.display());
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                },
-                Err(e) => {
-                    // Actual error occurred, log and wait
-                    warn!("Error loading initialization segments: {}, retrying in 5 seconds...", e);
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            }
-            
+            // Now we don't need to ensure initialization segments are loaded
             // Scan for TS segments
             let mut segment_files = Vec::new();
             if let Ok(entries) = fs::read_dir(&self.input_dir) {
@@ -404,27 +369,26 @@ impl HlsReader {
             for path in segment_files {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 
-            // Try to extract sequence number from filename
-            let sequence_number = if let Some(captures) = Regex::new(r"(\d+)\.ts")
-                .ok()
-                .and_then(|re| re.captures(&filename)) {
-                if let Some(num_str) = captures.get(1) {
-                    num_str.as_str().parse::<u32>().unwrap_or(0)
+                // Try to extract sequence number from filename
+                let sequence_number = if let Some(captures) = Regex::new(r"(\d+)\.ts")
+                    .ok()
+                    .and_then(|re| re.captures(&filename)) {
+                    if let Some(num_str) = captures.get(1) {
+                        num_str.as_str().parse::<u32>().unwrap_or(0)
+                    } else {
+                        0
+                    }
                 } else {
                     0
+                };
+                
+                if self.seen_segments.contains(&sequence_number) {
+                    continue;
                 }
-            } else {
-                0
-            };
-
-            // Check if we've seen this segment before
-            if self.seen_segments.contains(&sequence_number) {
-                continue;
-            }
-
-            // Add to tracking collections
-            self.seen_queue.push_back(sequence_number);
-            self.seen_segments.insert(sequence_number);
+                
+                // Add to tracking collections
+                self.seen_queue.push_back(sequence_number);
+                self.seen_segments.insert(sequence_number);
                 
                 // Maintain a reasonable collection size
                 if self.seen_queue.len() > MAX_SEEN {
@@ -445,8 +409,6 @@ impl HlsReader {
                 // Try to find the segment duration from the playlist - using fixed 2.0 as default
                 let duration = 2.0; // Default duration in seconds
                 
-                // For TS format, use the same segment data for both audio and video
-                // since they're combined in the same file
                 let timestamp = (self.current_timestamp * 30_000.0) as u64;
                 let duration_ticks = (duration * 30_000.0) as u32;
                 
@@ -455,10 +417,7 @@ impl HlsReader {
                     timestamp,
                     duration: duration_ticks,
                     segment_duration: duration as f32,
-                    audio_init: self.audio_init.clone().unwrap_or(Bytes::new()),
-                    video_init: self.video_init.clone().unwrap_or(Bytes::new()),
-                    audio_data: segment_data.clone(),
-                    video_data: segment_data,
+                    av_data: segment_data,
                 };
                 
                 info!("WMP Packet Summary:");
@@ -467,10 +426,7 @@ impl HlsReader {
                       format_timestamp(self.current_timestamp), wmp.timestamp);
                 info!("  duration         --> {} ticks", wmp.duration);
                 info!("  segment_duration --> {} seconds", wmp.segment_duration);
-                info!("  audio_init       --> {} bytes", wmp.audio_init.len());
-                info!("  video_init       --> {} bytes", wmp.video_init.len());
-                info!("  audio_data       --> {} bytes", wmp.audio_data.len());
-                info!("  video_data       --> {} bytes", wmp.video_data.len());
+                info!("  av_data          --> {} bytes", wmp.av_data.len());
                 
                 // Send the packet to the channel
                 if let Err(e) = tx.send(wmp) {
@@ -488,8 +444,6 @@ impl HlsReader {
 }
 
 struct PipeReader {
-    audio_init: Option<Bytes>,
-    video_init: Option<Bytes>,
     packet_id: u32,
     current_timestamp: f64,
     seen_segments: HashSet<u32>,
@@ -499,8 +453,6 @@ struct PipeReader {
 impl PipeReader {
     async fn new() -> Result<Self, VqdError> {
         Ok(Self {
-            audio_init: None,
-            video_init: None,
             packet_id: 0,
             current_timestamp: 0.0,
             seen_segments: HashSet::new(),
@@ -513,14 +465,6 @@ impl PipeReader {
         
         // Create a buffered reader for stdin
         let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        
-        // Initialize empty init segments if not already set
-        if self.audio_init.is_none() {
-            self.audio_init = Some(Bytes::from(Vec::new()));
-        }
-        if self.video_init.is_none() {
-            self.video_init = Some(Bytes::from(Vec::new()));
-        }
         
         info!("Started pipe reader, waiting for data on stdin...");
         
@@ -605,10 +549,7 @@ impl PipeReader {
                 timestamp,
                 duration: duration_ticks,
                 segment_duration: duration as f32,
-                audio_init: self.audio_init.clone().unwrap_or(Bytes::new()),
-                video_init: self.video_init.clone().unwrap_or(Bytes::new()),
-                audio_data: segment_data.clone(),
-                video_data: segment_data,
+                av_data: segment_data,
             };
             
             info!("WMP Packet Summary:");
@@ -617,10 +558,7 @@ impl PipeReader {
                   format_timestamp(self.current_timestamp), wmp.timestamp);
             info!("  duration         --> {} ticks", wmp.duration);
             info!("  segment_duration --> {} seconds", wmp.segment_duration);
-            info!("  audio_init       --> {} bytes", wmp.audio_init.len());
-            info!("  video_init       --> {} bytes", wmp.video_init.len());
-            info!("  audio_data       --> {} bytes", wmp.audio_data.len());
-            info!("  video_data       --> {} bytes", wmp.video_data.len());
+            info!("  av_data          --> {} bytes", wmp.av_data.len());
             
             // Send the packet to the channel
             if let Err(e) = tx.send(wmp) {
