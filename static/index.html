@@ -182,6 +182,8 @@ let xhrInterceptionEnabled = false;
 let streamCounter = 0;
 let bufferLoggingIntervals = [];
 window.blobUrlMap = new Map();
+let masterPlaylistUrl = null;
+let videoPlaylistUrl = null;
 
 window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
     // Store with both the exact name and the ID-based key
@@ -418,8 +420,13 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             // Use segmentDuration if available, otherwise default to 1.0
             const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
             videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
+            
+            // FIX: Always use the original segment ID in the manifest
+            // This ensures consistency between manifest entries and XHR requests
             const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
             videoPlaylist += `${segmentName}\n`;
+            
+            // Register segment with consistent naming
             window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
         }
         
@@ -432,11 +439,18 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     console.log("GENERATED VIDEO PLAYLIST:", videoPlaylist);
     log(`📄 VIDEO PLAYLIST CONTENT:\n${videoPlaylist}`);
     
-    // Create blob URLs for the playlists
+    // FIX: Only create new Blob URLs if they don't exist yet
+    // This provides stable URLs for HLS.js to work with
     const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
-    const videoPlaylistUrl = URL.createObjectURL(videoBlob);
+    if (!videoPlaylistUrl) {
+        videoPlaylistUrl = URL.createObjectURL(videoBlob);
+        log(`🔗 Created new video playlist URL: ${videoPlaylistUrl}`);
+    } else {
+        // Just update the map without changing URL
+        log(`🔄 Updating existing video playlist URL: ${videoPlaylistUrl}`);
+    }
     
-    // Now reference the full video playlist URL in the master playlist
+    // Now reference the video playlist URL in the master playlist
     masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
     masterPlaylist += `${videoPlaylistUrl}\n`;
     
@@ -444,9 +458,17 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     console.log("GENERATED MASTER PLAYLIST:", masterPlaylist);
     log(`📄 MASTER PLAYLIST CONTENT:\n${masterPlaylist}`);
     
-    // Create the master playlist blob
+    // FIX: Only create new master Blob URL if it doesn't exist yet
     const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
-    this.hlsUrl = URL.createObjectURL(masterBlob);
+    if (!masterPlaylistUrl) {
+        masterPlaylistUrl = URL.createObjectURL(masterBlob);
+        this.hlsUrl = masterPlaylistUrl;
+        log(`🔗 Created new master playlist URL: ${masterPlaylistUrl}`);
+    } else {
+        // Just update the map without changing URL
+        this.hlsUrl = masterPlaylistUrl;
+        log(`🔄 Updating existing master playlist URL: ${masterPlaylistUrl}`);
+    }
     
     // Make sure blobUrlMap is defined globally
     if (!window.blobUrlMap) {
@@ -480,16 +502,7 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     log(`🔄 Updated HLS manifests with new fragments`);
 };
 
-/**
- * Process a media fragment from a WebTransport packet
- * 
- * @param {number} trackId - The track ID (0 for video, 1 for audio)
- * @param {number} packetId - The packet ID
- * @param {Uint8Array} mediaData - The media data
- * @param {boolean} isVideo - Whether this is video data
- * @param {number} segmentDuration - The segment duration in seconds
- */
- WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId, packetId, mediaData, isVideo, segmentDuration = 1.0) {
+WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId, packetId, mediaData, isVideo, segmentDuration = 1.0) {
     const trackType = isVideo ? "video" : "audio";
     
     // Skip empty fragments
@@ -536,32 +549,9 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
         }
     }
     
-    // Use a consistent file naming convention for all segments
-    // This helps avoid issues with high-numbered segments
-    let normalizedId = packetId;
-    let segmentName = "";
-    
-    // Check if this is a sequential ID (small numeric value) or a randomly generated one
-    if (packetId < 1000000) {
-        // Regular sequential segment
-        segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
-    } else {
-        // High ID segments - might be random/generated IDs
-        // Store them with their actual ID but also give them a sequential display name
-        // to maintain proper order in the playlist
-        
-        // Find the next available sequential ID
-        const highestSeqId = Object.keys(this.buffer[trackType])
-            .filter(id => parseInt(id) < 1000000)
-            .map(id => parseInt(id))
-            .sort((a, b) => b - a)[0] || -1;
-            
-        normalizedId = highestSeqId + 1;
-        segmentName = `chunk-${normalizedId.toString().padStart(5, '0')}.ts`;
-        
-        // Log the ID mapping for debugging
-        log(`🔄 Mapping high segment ID #${packetId} to sequential ID #${normalizedId}`);
-    }
+    // FIX: Use a consistent naming approach for all segments
+    // Generate the segment name based on original packetId
+    const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
     
     // Store both the original data and normalized segment info
     this.buffer[trackType][packetId] = mediaData;
@@ -574,7 +564,6 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     // Add to fragments array with sequence info and segment duration
     this.trackBuffers[trackId].fragments.push({
         sequence: packetId,
-        normalizedId: normalizedId,  // Store the normalized ID
         data: mediaData,
         isKeyframe: true, // For MPEG-TS segments, treat all as keyframes
         timestamp: Date.now(),
@@ -583,31 +572,28 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
         segmentName: segmentName  // Store the segment name
     });
     
-    // Register the media segment for XHR interception with both names
+    // FIX: Register the media segment with consistent names
     if (typeof window.registerMediaSegment === 'function') {
+        // Register with the formatted segment name
         window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
         
-        // Also register with the original ID if it's different
-        if (normalizedId !== packetId) {
-            const originalSegmentName = `chunk-${packetId}.ts`;
-            window.registerMediaSegment(trackId, packetId, mediaData, originalSegmentName);
+        // Also register with a simpler name for legacy support
+        const simpleName = `chunk-${packetId}.ts`;
+        if (simpleName !== segmentName) {
+            window.registerMediaSegment(trackId, packetId, mediaData, simpleName);
         }
     }
     
     // Log fragment details
     if (isVideo && packetId % 10 === 0) {
-        log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B, duration=${segmentDuration.toFixed(3)}s`);
+        log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B, duration=${segmentDuration.toFixed(3)}s, name=${segmentName}`);
     }
     
     // Keep buffer size reasonable (keep last 30 fragments)
     if (this.trackBuffers[trackId].fragments.length > 30) {
         this.trackBuffers[trackId].fragments.sort((a, b) => {
-            // Sort by normalized ID first (for sequential consistency)
-            // then by timestamp as fallback
-            if (a.normalizedId !== undefined && b.normalizedId !== undefined) {
-                return a.normalizedId - b.normalizedId;
-            }
-            return a.timestamp - b.timestamp;
+            // Sort by sequence ID (equivalent to original packetId)
+            return a.sequence - b.sequence;
         });
         
         this.trackBuffers[trackId].fragments = this.trackBuffers[trackId].fragments.slice(-30);
@@ -632,6 +618,7 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     // Update HLS manifest if needed
     this._updateHLSManifest();
 };
+
 /**
  * WebTransport HLS.js Player - Part 3: HLS.js Integration
  */
@@ -727,15 +714,28 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
         this.trackBuffers[trackId].fragments = [];
     });
     
-    // Clear HLS data
-    if (this.hlsUrl && this.hlsUrl.startsWith('blob:')) {
+    // FIX: Properly clean up all blob URLs
+    if (masterPlaylistUrl) {
         try {
-            URL.revokeObjectURL(this.hlsUrl);
+            URL.revokeObjectURL(masterPlaylistUrl);
+            log(`🧹 Revoked master playlist URL: ${masterPlaylistUrl}`);
+            masterPlaylistUrl = null;
         } catch (e) {
-            // Ignore errors during cleanup
+            log(`⚠️ Error revoking master playlist URL: ${e.message}`);
         }
     }
     
+    if (videoPlaylistUrl) {
+        try {
+            URL.revokeObjectURL(videoPlaylistUrl);
+            log(`🧹 Revoked video playlist URL: ${videoPlaylistUrl}`);
+            videoPlaylistUrl = null;
+        } catch (e) {
+            log(`⚠️ Error revoking video playlist URL: ${e.message}`);
+        }
+    }
+    
+    // Clear HLS data
     this.hlsData = null;
     this.hlsUrl = '/vivoh.m3u8';
     
@@ -743,6 +743,41 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
     this.init.video = null;
     this.init.audio = null;
 };
+
+function enhanceXHRDebugging() {
+    // Only run this if XHR interception is already enabled
+    if (!window.xhrInterceptionEnabled) return;
+    
+    log("🔍 Enhancing XMLHttpRequest debugging");
+    
+    // Store the original send method
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    
+    // Override send method to add additional logging
+    XMLHttpRequest.prototype.send = function(body) {
+        // Log segment requests for debugging purposes
+        if (this._isMediaSegment) {
+            log(`🔍 XHR REQUEST: Segment=${this._segmentName || "unknown"}, URL=${this._url}`);
+            
+            // Check if we have this segment registered
+            if (window.blobUrlMap && this._segmentName) {
+                const hasSegment = window.blobUrlMap.has(this._segmentName);
+                log(`🔍 Blob map has segment "${this._segmentName}": ${hasSegment}`);
+                
+                // If not found, log available segment names for debugging
+                if (!hasSegment && window.blobUrlMap.size < 20) {
+                    log(`🔍 Available segments: ${Array.from(window.blobUrlMap.keys()).filter(k => k.includes('.ts')).join(', ')}`);
+                }
+            }
+        }
+        
+        // Call the original send method
+        return originalXHRSend.call(this, body);
+    };
+    
+    log(`✅ XHR debugging enhancement completed`);
+    return true;
+}
 
     /**
      * Set up XHR interception for HLS.js segment requests
@@ -1348,7 +1383,10 @@ function setupPacketHandlerCallbacks() {
  * @param {string} url - WebTransport server URL
  * @returns {WebTransportHLSPacketHandler} - The packet handler
  */
- async function setupWebTransport(url) {
+// Fix: Call setupXHRInterception and the debugging enhancement
+// in the setupWebTransport function
+
+async function setupWebTransport(url) {
     try {
         window.disconnectionRequested = false;
         
@@ -1369,6 +1407,13 @@ function setupPacketHandlerCallbacks() {
         
         // Set up improved callbacks
         setupPacketHandlerCallbacks();
+        
+        // IMPORTANT: Set up XHR interception before connecting
+        // This ensures the interception is ready when HLS.js starts requesting segments
+        setupXHRInterception();
+        
+        // Add enhanced debugging (optional but recommended)
+        enhanceXHRDebugging();
         
         // Connect to WebTransport 
         log(`🔗 Connecting to WebTransport server: ${url}`);
