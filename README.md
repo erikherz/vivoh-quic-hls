@@ -2,7 +2,7 @@ The goal is to deliver a standard HLS origin file set to a CDN and then a browse
 
 The browser will buffer the HLS data, start hls.js, and intercept server requests via XHR.
 
-STATUS: Needs testing.
+STATUS: Playback is broken.
 
 Server Command:
 ```
