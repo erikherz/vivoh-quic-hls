@@ -28,10 +28,7 @@ pub struct WebTransportMediaPacket {
     pub timestamp: u64,
     pub duration: u32,
     pub segment_duration: f32,  // Duration in seconds, typically 1.0
-    pub audio_init: Bytes,
-    pub video_init: Bytes,
-    pub audio_data: Bytes,
-    pub video_data: Bytes,
+    pub av_data: Bytes,
 }
 
 impl WebTransportMediaPacket {
@@ -49,31 +46,23 @@ impl WebTransportMediaPacket {
         let duration = cursor.get_u32();
         let segment_duration = cursor.get_f32();
 
-        let field_lengths = [
-            cursor.get_u32() as usize, // audio_init
-            cursor.get_u32() as usize, // video_init
-            cursor.get_u32() as usize, // audio_data
-            cursor.get_u32() as usize, // video_data
-        ];
+        // Get the length of av_data field
+        let av_data_len = cursor.get_u32() as usize;
 
-        let mut extract = |len: usize| -> Result<Bytes, crate::VqdError> {
-            if cursor.remaining() < len {
-                return Err(crate::VqdError::Other("WMP truncated".into()));
-            }
-            let mut buf = vec![0u8; len];
-            cursor.copy_to_slice(&mut buf);
-            Ok(Bytes::from(buf))
-        };
+        if cursor.remaining() < av_data_len {
+            return Err(crate::VqdError::Other("WMP truncated".into()));
+        }
+        
+        let mut av_buffer = vec![0u8; av_data_len];
+        cursor.copy_to_slice(&mut av_buffer);
+        let av_data = Bytes::from(av_buffer);
 
         Ok(Self {
             packet_id,
             timestamp,
             duration,
             segment_duration,
-            audio_init: extract(field_lengths[0])?,
-            video_init: extract(field_lengths[1])?,
-            audio_data: extract(field_lengths[2])?,
-            video_data: extract(field_lengths[3])?,
+            av_data,
         })
     }
 }
@@ -130,20 +119,11 @@ pub fn serialize_media_packet(packet: &WebTransportMediaPacket) -> bytes::Bytes 
     buf.put_u32(packet.duration);
     buf.put_f32(packet.segment_duration);
 
-    let fields = [
-        &packet.audio_init,
-        &packet.video_init,
-        &packet.audio_data,
-        &packet.video_data,
-    ];
-
-    for field in &fields {
-        buf.put_u32(field.len() as u32);
-    }
-
-    for field in &fields {
-        buf.put_slice(field);
-    }
+    // Put the length of av_data
+    buf.put_u32(packet.av_data.len() as u32);
+    
+    // Put the actual av_data
+    buf.put_slice(&packet.av_data);
 
     buf.freeze()
 }
@@ -342,4 +322,3 @@ pub mod tls {
 pub use bytes;
 pub use anyhow;
 pub use VqdError as Error;
-

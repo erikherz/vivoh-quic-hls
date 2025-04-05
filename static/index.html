@@ -263,11 +263,6 @@ class WebTransportHLSPacketHandler {
             this.lastProcessedPacketId = packetId;
             this.packetsReceived++;
             
-            // Extract manifest data (using MPD field for HLS data)
-            if (!this.hlsData && fields.mpd.byteLength > 0) {
-                this._processHLSData(fields.mpd);
-            }
-            
             // Extract initialization segments
             if (!this.init.audio && fields.audioInit.byteLength > 0) {
                 this.init.audio = fields.audioInit;
@@ -303,6 +298,11 @@ class WebTransportHLSPacketHandler {
             
             // Check if we have enough data to start playback
             this._checkPlaybackReadiness();
+
+            // Generate manifest after receiving a few packets if we don't have one yet
+            if (!this.hlsData && this.packetsReceived >= 3) {
+                this._generateHLSManifest();
+            }
             
             return true;
         } catch (error) {
@@ -330,55 +330,39 @@ class WebTransportHLSPacketHandler {
             throw new Error(`Invalid data type for packet: ${typeof data}`);
         }
     }
+}
 
-    /**
- * WebTransport HLS.js Player - Part 2: Media Processing
- */
-
-// Continue WebTransportHLSPacketHandler class methods
 WebTransportHLSPacketHandler.prototype._extractPacketHeader = function(dataArray) {
     const view = new DataView(dataArray.buffer, dataArray.byteOffset, dataArray.byteLength);
     
-    // Extract header fields
+    // Extract header fields that are actually in your packet
     const packetId = view.getUint32(0);
     const timestamp = view.getBigUint64(4);
     const duration = view.getUint32(12);
     
-    // Extract field lengths
-    const mpdLength = view.getUint32(16);
-    const audioInitLength = view.getUint32(20);
-    const videoInitLength = view.getUint32(24);
-    const audioDataLength = view.getUint32(28);
-    const videoDataLength = view.getUint32(32);
+    // New field in your structure
+    const segmentDuration = view.getFloat32(16);
     
-    // Calculate field positions
-    let position = 36;  // Start after header and field lengths
+    // The rest of the data is just the AV data
+    const avData = dataArray.slice(20); // Starting position after the header
     
-    // Extract each field
-    const mpd = dataArray.slice(position, position + mpdLength);
-    position += mpdLength;
-    
-    const audioInit = dataArray.slice(position, position + audioInitLength);
-    position += audioInitLength;
-    
-    const videoInit = dataArray.slice(position, position + videoInitLength);
-    position += videoInitLength;
-    
-    const audioData = dataArray.slice(position, position + audioDataLength);
-    position += audioDataLength;
-    
-    const videoData = dataArray.slice(position, position + videoDataLength);
-    
+    // For compatibility with your existing code, map this to the fields your
+    // code expects, but with most being empty except the media data
     return {
         packetId,
         timestamp,
         duration,
+        segmentDuration, // New field
         fields: {
-            mpd,
-            audioInit,
-            videoInit,
-            audioData,
-            videoData
+            // These fields don't exist in your actual packet, set them to empty
+            mpd: new Uint8Array(0),
+            audioInit: new Uint8Array(0),
+            videoInit: new Uint8Array(0),
+            
+            // Place all AV data in videoData for now
+            // (or you might need to handle this differently based on your implementation)
+            audioData: new Uint8Array(0), 
+            videoData: avData
         }
     };
 };
@@ -425,81 +409,63 @@ WebTransportHLSPacketHandler.prototype._processHLSData = function(data) {
 WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     // Create a basic master playlist
     let masterPlaylist = '#EXTM3U\n';
-    masterPlaylist += '#EXT-X-VERSION:4\n';
-    
-    // Add audio variant
-    masterPlaylist += '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,URI="audio.m3u8"\n';
-    
-    // Add video variant
-    masterPlaylist += '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="audio"\n';
-    masterPlaylist += 'video.m3u8\n';
+    masterPlaylist += '#EXT-X-VERSION:3\n';
     
     // Create a video media playlist
     let videoPlaylist = '#EXTM3U\n';
-    videoPlaylist += '#EXT-X-VERSION:4\n';
+    videoPlaylist += '#EXT-X-VERSION:3\n';
     videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
-    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:1\n';
+    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     
     // Add segment entries for video
     const videoSegments = Object.keys(this.buffer.video)
-        .sort((a, b) => parseInt(a) - parseInt(b));
+        .map(Number)
+        .sort((a, b) => a - b);
     
-    for (let i = 0; i < videoSegments.length; i++) {
-        const segId = videoSegments[i];
-        // Assume 4 second segments for simplicity
+    if (videoSegments.length === 0) {
+        // Add a dummy segment if no segments are available yet
         videoPlaylist += '#EXTINF:4.0,\n';
-        videoPlaylist += `chunk_0_${segId}.m4s\n`;
-    }
-    
-    if (videoSegments.length > 0) {
-        // Only mark as ended if we have a complete stream
+        videoPlaylist += 'chunk_0_init.m4s\n';
+    } else {
+        for (let i = 0; i < videoSegments.length; i++) {
+            const segId = videoSegments[i];
+            videoPlaylist += '#EXTINF:4.0,\n';
+            videoPlaylist += `chunk_0_${segId}.m4s\n`;
+        }
+        
         if (this.isDisconnected) {
             videoPlaylist += '#EXT-X-ENDLIST\n';
         }
     }
     
-    // Create an audio media playlist
-    let audioPlaylist = '#EXTM3U\n';
-    audioPlaylist += '#EXT-X-VERSION:4\n';
-    audioPlaylist += '#EXT-X-TARGETDURATION:4\n';
-    audioPlaylist += '#EXT-X-MEDIA-SEQUENCE:1\n';
-    
-    // Add segment entries for audio
-    const audioSegments = Object.keys(this.buffer.audio)
-        .sort((a, b) => parseInt(a) - parseInt(b));
-    
-    for (let i = 0; i < audioSegments.length; i++) {
-        const segId = audioSegments[i];
-        // Assume 4 second segments for simplicity
-        audioPlaylist += '#EXTINF:4.0,\n';
-        audioPlaylist += `chunk_1_${segId}.m4s\n`;
-    }
-    
-    if (audioSegments.length > 0) {
-        // Only mark as ended if we have a complete stream
-        if (this.isDisconnected) {
-            audioPlaylist += '#EXT-X-ENDLIST\n';
-        }
-    }
-    
-    // Store the generated master playlist
-    this.hlsData = masterPlaylist;
-    
     // Create blob URLs for the playlists
-    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
-    const audioBlob = new Blob([audioPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    const videoPlaylistUrl = URL.createObjectURL(videoBlob);
     
+    // Now reference the full video playlist URL in the master playlist
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.42c01e,mp4a.40.2"\n`;
+    masterPlaylist += `${videoPlaylistUrl}\n`;
+    
+    // Create the master playlist blob
+    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     this.hlsUrl = URL.createObjectURL(masterBlob);
     
-    // Register all playlists for XHR interception
-    if (typeof window.registerManifestBlobUrl === 'function') {
-        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
-        window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
-        window.registerManifestBlobUrl('audio.m3u8', audioPlaylist);
+    // Make sure blobUrlMap is defined globally
+    if (!window.blobUrlMap) {
+        window.blobUrlMap = new Map();
     }
     
-    log(`✅ Generated HLS manifests and registered blob URLs`);
+    // Register all playlists for XHR interception
+    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
+    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
+    
+    // Also use the registerManifestBlobUrl function if available
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
+    }
+    
+    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
     
     // Notify that the HLS is ready
     if (typeof this.onHLSReady === 'function') {
@@ -603,7 +569,6 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
  * WebTransport HLS.js Player - Part 3: HLS.js Integration
  */
 
-// Complete WebTransportHLSPacketHandler methods
 WebTransportHLSPacketHandler.prototype._checkPlaybackReadiness = function() {
     // If player already exists, don't create another one
     if (window.player) {
@@ -1164,13 +1129,286 @@ function setupHLSPlayer(hlsUrl = '/vivoh.m3u8') {
     }
 }
 
+function enhanceXHRInterception() {
+    // Only run this if XHR interception is already enabled
+    if (!window.xhrInterceptionEnabled) return;
+    
+    log("🔧 Enhancing XMLHttpRequest interception for HLS");
+    
+    // Store the original open and send methods
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    
+    // Override open method with improved URL pattern detection
+    XMLHttpRequest.prototype.open = function(method, url, async) {
+        this._url = url;
+        this._method = method;
+        
+        if (method === 'GET' && typeof url === 'string') {
+            if (url.includes('debug')) {
+                log(`🔍 XHR Request: ${method} ${url}`);
+            }
+        }
+        
+        // Track request type with improved patterns
+        if (typeof url === 'string') {
+            // Blob URLs for manifests we've registered
+            if (url.startsWith('blob:') && window.blobUrlMap && window.blobUrlMap.has(url)) {
+                this._isManifestBlobUrl = true;
+                log(`📄 Recognized manifest blob URL: ${url}`);
+            }
+            // HLS manifest (.m3u8) requests - broader pattern matching
+            else if (url.includes('.m3u8') || url === 'video.m3u8' || url === 'audio.m3u8') {
+                this._isManifestRequest = true;
+                log(`📄 HLS manifest request detected: ${url}`);
+                
+                // Store specific manifest type
+                if (url.includes('video')) {
+                    this._manifestType = 'video';
+                } else if (url.includes('audio')) {
+                    this._manifestType = 'audio';
+                } else {
+                    this._manifestType = 'master';
+                }
+            } 
+            // Init segment requests with more patterns
+            else if (url.includes('init') || url.includes('init.mp4') || url.includes('chunk_0_init.m4s')) {
+                this._isInitSegment = true;
+                
+                // Extract track ID from URL pattern
+                const matchTrack = url.match(/chunk_(\d+)_init/) || url.match(/init[_-](\d+)/);
+                if (matchTrack) {
+                    this._trackId = parseInt(matchTrack[1]);
+                    log(`🔑 Init segment request for track ${this._trackId}`);
+                } else {
+                    // Default to video track if pattern doesn't match
+                    this._trackId = 0;
+                    log(`🔑 Init segment request defaulting to video track`);
+                }
+            } 
+            // Media segment requests with more patterns
+            else if (url.match(/chunk[_-]\d+[_-]\d+\.m4s/) || url.match(/segment[_-]\d+[_-]\d+/)) {
+                this._isMediaSegment = true;
+                
+                // Extract track and segment IDs from various URL patterns
+                let matchSegment = url.match(/chunk[_-](\d+)[_-](\d+)\.m4s/) || 
+                                  url.match(/segment[_-](\d+)[_-](\d+)/);
+                
+                if (matchSegment) {
+                    this._trackId = parseInt(matchSegment[1]);
+                    this._segmentId = parseInt(matchSegment[2]);
+                    log(`🎬 Media segment request: track=${this._trackId}, segment=${this._segmentId}`);
+                }
+            }
+        }
+        
+        originalXHROpen.call(this, method, url, async !== false);
+    };
+    
+    // Enhance send method to better handle manifest requests
+    XMLHttpRequest.prototype.send = function(body) {
+        // Check if this is a request for a video/audio playlist
+        if (this._isManifestRequest && this._manifestType === 'video' && window.packetHandler) {
+            // Generate a fresh video playlist
+            const videoPlaylist = generateVideoPlaylist(window.packetHandler);
+            log(`📄 Serving freshly generated video playlist`);
+            
+            setTimeout(() => {
+                this.responseType = 'text';
+                Object.defineProperty(this, 'response', { get: () => videoPlaylist });
+                Object.defineProperty(this, 'responseText', { get: () => videoPlaylist });
+                Object.defineProperty(this, 'status', { get: () => 200 });
+                Object.defineProperty(this, 'statusText', { get: () => 'OK' });
+                Object.defineProperty(this, 'readyState', { get: () => 4 });
+                
+                this.dispatchEvent(new Event('readystatechange'));
+                this.dispatchEvent(new Event('load'));
+                this.dispatchEvent(new Event('loadend'));
+            }, 10);
+            
+            return;
+        }
+        
+        // For requests we're not handling in our enhanced version, call the original implementation
+        originalXHRSend.call(this, body);
+    };
+    
+    log(`✅ Enhanced XHR interception setup completed`);
+    return true;
+}
+
+// Helper function to generate a valid video playlist
+function generateVideoPlaylist(packetHandler) {
+    let videoPlaylist = '#EXTM3U\n';
+    videoPlaylist += '#EXT-X-VERSION:3\n';
+    videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
+    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
+    
+    // Add segment entries for video
+    const videoSegments = Object.keys(packetHandler.buffer.video)
+        .map(Number)
+        .sort((a, b) => a - b);
+    
+    if (videoSegments.length === 0) {
+        // Add a dummy segment if no segments are available yet
+        videoPlaylist += '#EXTINF:4.0,\n';
+        videoPlaylist += 'chunk_0_init.m4s\n';
+    } else {
+        for (let i = 0; i < videoSegments.length; i++) {
+            const segId = videoSegments[i];
+            videoPlaylist += '#EXTINF:4.0,\n';
+            videoPlaylist += `chunk_0_${segId}.m4s\n`;
+        }
+        
+        if (packetHandler.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
+        }
+    }
+    
+    // Register the updated playlist
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
+    }
+    
+    return videoPlaylist;
+}
+
+function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
+    try {
+        if (!window.Hls) {
+            log("❌ HLS.js library not found!");
+            return null;
+        }
+        
+        if (!Hls.isSupported()) {
+            log("❌ HLS.js is not supported in this browser");
+            return null;
+        }
+        
+        const videoElement = document.getElementById('videoElement');
+        if (!videoElement) {
+            log("❌ Video element not found");
+            return null;
+        }
+        
+        // Create HLS.js player with improved configuration
+        const hls = new Hls({
+            debug: false,
+            enableWorker: true,
+            lowLatencyMode: true,
+            startLevel: 0,
+            
+            // More permissive buffer configuration
+            maxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            maxBufferSize: 60 * 1000 * 1000, // 60MB
+            
+            // More robust error handling
+            maxBufferHole: 1,
+            fragLoadingMaxRetry: 8,
+            manifestLoadingMaxRetry: 8,
+            levelLoadingMaxRetry: 8,
+            manifestLoadingRetryDelay: 500,
+            fragLoadingRetryDelay: 500,
+            levelLoadingRetryDelay: 500,
+            
+            // Error recovery
+            recoverMediaError: true
+        });
+        
+        // Set up event listeners
+        hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+            log("🎬 HLS.js attached to media element");
+            hls.loadSource(hlsUrl);
+        });
+        
+        hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+            log(`📄 HLS manifest parsed: ${data.levels.length} quality levels`);
+            window.playerState = 'ready';
+            
+            // Enable play button when ready
+            const playButton = document.getElementById('playButton');
+            if (playButton) {
+                playButton.disabled = false;
+            }
+            
+            updateUI();
+        });
+        
+        // Add improved error handling
+        hls.on(Hls.Events.ERROR, (event, data) => {
+            if (data.details === 'manifestParsingError' || data.details === 'levelParsingError') {
+                log(`⚠️ Manifest parsing error: ${data.reason}`);
+                
+                // If this is a manifest error, try to regenerate the manifest
+                if (window.packetHandler) {
+                    window.packetHandler._generateHLSManifest();
+                    log("🔄 Regenerated HLS manifest due to parsing error");
+                }
+            }
+            
+            if (data.fatal) {
+                log(`⚠️ Fatal error: ${data.details}`);
+                
+                switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        log("🔄 Attempting to recover from network error");
+                        hls.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        log("🔄 Attempting to recover from media error");
+                        hls.recoverMediaError();
+                        break;
+                    default:
+                        log("❌ Cannot recover from error");
+                        window.playerState = 'error';
+                        updateUI();
+                        break;
+                }
+            }
+        });
+        
+        // Attach to video element
+        hls.attachMedia(videoElement);
+        
+        // Store the player globally
+        window.player = hls;
+        log(`✅ HLS.js player initialized with URL: ${hlsUrl}`);
+        
+        return hls;
+    } catch (error) {
+        log(`❌ Error initializing HLS player: ${error.message}`);
+        return null;
+    }
+}
+
+// Function to set up packet handler callbacks
+function setupPacketHandlerCallbacks() {
+    if (!window.packetHandler) return;
+    
+    // Override the onHLSReady callback with improved player initialization
+    window.packetHandler.onHLSReady = (hlsUrl) => {
+        log(`📄 HLS ready for playback: ${hlsUrl}`);
+        
+        // Use the improved player initialization
+        if (!window.player) {
+            initializeHLSPlayer(hlsUrl);
+        } else {
+            log(`📄 Player already exists, loading source: ${hlsUrl}`);
+            window.player.loadSource(hlsUrl);
+        }
+    };
+    
+    log("✅ Packet handler callbacks configured");
+}
+
 /**
  * Setup WebTransport connection and handlers for HLS
  * 
  * @param {string} url - WebTransport server URL
  * @returns {WebTransportHLSPacketHandler} - The packet handler
  */
-async function setupWebTransport(url) {
+ async function setupWebTransport(url) {
     try {
         window.disconnectionRequested = false;
         
@@ -1189,14 +1427,8 @@ async function setupWebTransport(url) {
         // Initialize packet handler for HLS
         window.packetHandler = new WebTransportHLSPacketHandler();
         
-        // Set HLS ready callback to initialize player
-        window.packetHandler.onHLSReady = (hlsUrl) => {
-            log(`📄 HLS ready for playback: ${hlsUrl}`);
-            setupHLSPlayer(hlsUrl);
-        };
-        
-        // Setup XHR interception BEFORE creating WebTransport connection
-        setupXHRInterception();
+        // Set up improved callbacks
+        setupPacketHandlerCallbacks();
         
         // Connect to WebTransport 
         log(`🔗 Connecting to WebTransport server: ${url}`);
@@ -1258,6 +1490,290 @@ function log(message) {
     logEl.scrollTop = logEl.scrollHeight;
     console.log(message);
 }
+
+/**
+ * Listen for incoming streams and process WebTransport data
+ */
+ async function listenToIncomingStreams(transport, packetHandler) {
+    // Reset stream counter
+    window.streamCounter = 0;
+    
+    try {
+        log("🎧 Listening for incoming streams...");
+        
+        // Handle readable streams from the server
+        const reader = transport.incomingUnidirectionalStreams.getReader();
+        
+        // Track active readers for cleanup
+        window.activeReaders = [];
+        
+        while (!window.disconnectionRequested) {
+            const { value: stream, done } = await reader.read();
+            
+            if (done) {
+                log("📢 Server finished sending streams");
+                break;
+            }
+            
+            // Increment stream counter
+            window.streamCounter++;
+            
+            // Handle this specific stream
+            handleIncomingStream(stream, packetHandler);
+        }
+    } catch (error) {
+        log(`❌ Error in stream listener: ${error.message}`);
+        if (!window.disconnectionRequested) {
+            // Only show error message if not intentionally disconnected
+            handleConnectionClosed();
+        }
+    }
+}
+
+/**
+ * Process an individual incoming stream
+ */
+async function handleIncomingStream(stream, packetHandler) {
+    const reader = stream.getReader();
+    window.activeReaders.push(reader);
+    
+    try {
+        log(`📥 Processing incoming stream #${window.streamCounter}`);
+        
+        while (!window.disconnectionRequested) {
+            const { value, done } = await reader.read();
+            
+            if (done) {
+                log(`📤 Stream #${window.streamCounter} ended`);
+                break;
+            }
+            
+            if (value && value.byteLength > 0) {
+                // Process WebTransport media packet
+                packetHandler.processWMPPacket(value);
+                
+                // Update UI counter
+                document.getElementById('packetCounter').textContent = 
+                    packetHandler.packetsReceived.toString();
+            }
+        }
+    } catch (error) {
+        log(`❌ Error reading stream: ${error.message}`);
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch (e) {
+            // Ignore errors during cleanup
+        }
+        
+        // Remove from active readers list
+        const index = window.activeReaders.indexOf(reader);
+        if (index !== -1) {
+            window.activeReaders.splice(index, 1);
+        }
+    }
+}
+
+/**
+ * Handle connection close events
+ */
+function handleConnectionClosed() {
+    log("🛑 Connection closed");
+    
+    // Update UI
+    document.getElementById('connectionStatus').textContent = "Disconnected";
+    document.getElementById('connectionStatus').className = "status-badge status-disconnected";
+    
+    // Re-enable connect button
+    document.getElementById('connectButton').disabled = false;
+    document.getElementById('playButton').disabled = true;
+    document.getElementById('disconnectButton').disabled = true;
+    
+    // Stop status updates
+    if (window.statusInterval) {
+        clearInterval(window.statusInterval);
+        window.statusInterval = null;
+    }
+    
+    // Clean up readers
+    window.activeReaders.forEach(reader => {
+        try { reader.releaseLock(); } catch (e) { /* Ignore */ }
+    });
+    window.activeReaders = [];
+    
+    // Stop video playback
+    if (window.player) {
+        try {
+            window.player.destroy();
+        } catch (e) {
+            log(`⚠️ Error destroying player: ${e.message}`);
+        }
+        window.player = null;
+    }
+    
+    // Reset packet handler
+    if (window.packetHandler) {
+        try {
+            window.packetHandler.disconnect();
+        } catch (e) {
+            log(`⚠️ Error disconnecting packet handler: ${e.message}`);
+        }
+        window.packetHandler = null;
+    }
+    
+    // Reset transport
+    if (window.transport) {
+        try {
+            window.transport.close();
+        } catch (e) {
+            log(`⚠️ Error closing transport: ${e.message}`);
+        }
+        window.transport = null;
+    }
+    
+    window.playerState = 'idle';
+    updateUI();
+}
+
+/**
+ * Update UI elements based on current state
+ */
+function updateUI() {
+    // Update connection status
+    const connectionStatus = document.getElementById('connectionStatus');
+    connectionStatus.textContent = window.transport ? "Connected" : "Disconnected";
+    connectionStatus.className = window.transport ? 
+        "status-badge status-connected" : "status-badge status-disconnected";
+    
+    // Update button states
+    document.getElementById('connectButton').disabled = !!window.transport;
+    document.getElementById('disconnectButton').disabled = !window.transport;
+    
+    // Update player status
+    const playerStatus = document.getElementById('playerStatus');
+    switch (window.playerState) {
+        case 'playing':
+            playerStatus.textContent = "Playing";
+            playerStatus.className = "status-badge status-connected";
+            break;
+        case 'paused':
+            playerStatus.textContent = "Paused";
+            playerStatus.className = "status-badge";
+            break;
+        case 'buffering':
+            playerStatus.textContent = "Buffering";
+            playerStatus.className = "status-badge status-buffering";
+            break;
+        case 'error':
+            playerStatus.textContent = "Error";
+            playerStatus.className = "status-badge status-disconnected";
+            break;
+        case 'ready':
+            playerStatus.textContent = "Ready";
+            playerStatus.className = "status-badge";
+            break;
+        default:
+            playerStatus.textContent = "Idle";
+            playerStatus.className = "status-badge";
+    }
+    
+    // Update buffer status if available
+    if (window.packetHandler) {
+        const stats = window.packetHandler.getStats();
+        document.getElementById('bufferStatus').textContent = 
+            `${stats.fragmentsAvailable} fragments`;
+    } else {
+        document.getElementById('bufferStatus').textContent = "0 fragments";
+    }
+    
+    // Update stream counter
+    document.getElementById('streamCounter').textContent = 
+        window.streamCounter ? window.streamCounter.toString() : "0";
+    
+    // Update packet counter
+    if (window.packetHandler) {
+        document.getElementById('packetCounter').textContent = 
+            window.packetHandler.packetsReceived.toString();
+    } else {
+        document.getElementById('packetCounter').textContent = "0";
+    }
+}
+
+/**
+ * Start periodic status updates
+ */
+function startStatusUpdates() {
+    if (window.statusInterval) {
+        clearInterval(window.statusInterval);
+    }
+    
+    window.statusInterval = setInterval(() => {
+        updateUI();
+    }, 1000);
+}
+
+// Set up event listeners for buttons
+document.addEventListener('DOMContentLoaded', function() {
+    // Connect button
+    document.getElementById('connectButton').addEventListener('click', async function() {
+        try {
+            const url = document.getElementById('wtUrl').value;
+            
+            if (!url || !url.startsWith('https://')) {
+                alert('Please enter a valid HTTPS WebTransport URL');
+                return;
+            }
+            
+            // Disable connect button while connecting
+            this.disabled = true;
+            log(`🔗 Connecting to ${url}...`);
+            
+            // Update UI to show connection in progress
+            document.getElementById('connectionStatus').textContent = "Connecting...";
+            
+            // Attempt to setup WebTransport connection
+            await setupWebTransport(url);
+            
+            // Update connection status
+            document.getElementById('connectionStatus').textContent = "Connected";
+            document.getElementById('connectionStatus').className = "status-badge status-connected";
+            
+            // Enable disconnect button
+            document.getElementById('disconnectButton').disabled = false;
+            
+        } catch (error) {
+            log(`❌ Connection failed: ${error.message}`);
+            this.disabled = false;
+            document.getElementById('connectionStatus').textContent = "Failed";
+            document.getElementById('connectionStatus').className = "status-badge status-disconnected";
+        }
+    });
+    
+    // Play button
+    document.getElementById('playButton').addEventListener('click', function() {
+        if (window.player) {
+            const videoElement = document.getElementById('videoElement');
+            videoElement.play().catch(err => {
+                log(`❌ Error playing: ${err.message}`);
+            });
+            log(`▶️ Playing video`);
+        } else {
+            log(`⚠️ Player not initialized yet`);
+        }
+    });
+    
+    // Disconnect button
+    document.getElementById('disconnectButton').addEventListener('click', function() {
+        window.disconnectionRequested = true;
+        log(`🔌 Disconnecting...`);
+        
+        handleConnectionClosed();
+    });
+    
+    // Initialize UI
+    updateUI();
+    log(`🚀 Player initialized and ready`);
+});
     </script>
 </body>
 </html>
