@@ -181,6 +181,14 @@ let activeReaders = [];
 let xhrInterceptionEnabled = false;
 let streamCounter = 0;
 let bufferLoggingIntervals = [];
+window.blobUrlMap = new Map();
+
+window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
+    // Store with both the exact name and the ID-based key
+    window.blobUrlMap.set(segmentName, data);
+    window.blobUrlMap.set(`segment-${trackId}-${segmentId}`, data);
+    log(`🔗 Registered segment: ${segmentName}`);
+};
 
 /**
  * WebTransportHLSPacketHandler class
@@ -392,7 +400,7 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     // Create a video media playlist
     let videoPlaylist = '#EXTM3U\n';
     videoPlaylist += '#EXT-X-VERSION:3\n';
-    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match your ffmpeg -hls_time 1
+    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match ffmpeg -hls_time 1
     videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     
     // Add segment entries for video
@@ -410,8 +418,9 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             // Use segmentDuration if available, otherwise default to 1.0
             const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
             videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
-            // Match the format from your ffmpeg command
-            videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
+            const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
+            videoPlaylist += `${segmentName}\n`;
+            window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
         }
         
         if (this.isDisconnected) {
@@ -528,10 +537,9 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
         segmentDuration: segmentDuration // Store segment duration from packet
     });
     
-    // Register the media segment for XHR interception
+    // Register the media segment for XHR interception with exact filename
+    const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
     if (typeof window.registerMediaSegment === 'function') {
-        // Use your ffmpeg pattern for the segment name
-        const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
         window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
     }
     
@@ -699,12 +707,6 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
             log(`📄 Registered manifest blob URL: ${url}`);
         };
         
-        // Add method to register media segments
-        window.registerMediaSegment = (trackId, segmentId, data) => {
-            const key = `segment-${trackId}-${segmentId}`;
-            blobUrlMap.set(key, data);
-        };
-        
         // Override open method to track request type
     // In setupXHRInterception(), update the XMLHttpRequest.prototype.open override:
     XMLHttpRequest.prototype.open = function(method, url, async) {
@@ -727,24 +729,23 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
                 this._isManifestRequest = true;
                 log(`📄 HLS manifest request detected: ${url}`);
             } 
-            // TS segment requests - match your ffmpeg output pattern
-            else if (url.includes('.ts') || url.match(/chunk-\d+\.ts/) || url.match(/chunk-\d{5}\.ts/)) {
+            else if (url.includes('.ts') || url.match(/chunk-\d+\.ts/)) {
                 this._isMediaSegment = true;
                 
-                // Extract segment ID from pattern matching ffmpeg output
-                const matchSegment = url.match(/chunk-(\d+)\.ts/) || 
-                                    url.match(/chunk-(\d{5})\.ts/);
+                // Extract the exact segment name from the URL
+                const urlParts = url.split('/');
+                const segmentName = urlParts[urlParts.length - 1];
                 
+                // Store the segment name for later use
+                this._segmentName = segmentName;
+                
+                // Try to extract segment ID from pattern
+                const matchSegment = segmentName.match(/chunk-(\d+)\.ts/);
                 if (matchSegment) {
                     this._segmentId = parseInt(matchSegment[1]);
                     this._trackId = 0; // Default to video track for TS segments
-                    log(`🎬 TS segment request: segment=${this._segmentId}`);
+                    log(`🎬 TS segment request: segment=${this._segmentId}, name=${segmentName}`);
                 }
-            }
-            // Init segment requests - not needed for TS but kept for completeness
-            else if (url.includes('init') || url.includes('init.mp4')) {
-                this._isInitSegment = true;
-                log(`🔑 Init segment request detected, but not needed for TS streams`);
             }
         }
         
@@ -850,90 +851,28 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
             }
         }
         
-        // Media Segment Request
-        if (this._isMediaSegment && typeof this._trackId !== 'undefined' && typeof this._segmentId !== 'undefined') {
-            const trackId = this._trackId;
-            const segmentId = this._segmentId;
-            const trackType = trackId === 0 ? "video" : "audio";
+        if (this._isMediaSegment) {
+            // First look for segments by name if available
+            if (this._segmentName && window.blobUrlMap && window.blobUrlMap.has(this._segmentName)) {
+                const segmentData = window.blobUrlMap.get(this._segmentName);
+                serveSegmentData(this, segmentData, this._segmentName);
+                return;
+            }
             
-            // Try to get segment from packetHandler
-            let segmentData = null;
-            
-            // First check if exact segment exists in buffer
-            if (window.packetHandler && window.packetHandler.buffer[trackType][segmentId]) {
-                segmentData = window.packetHandler.buffer[trackType][segmentId];
-                log(`🎬 Found exact segment: track=${trackId}, segment=${segmentId}`);
-            } 
-            // If not, try to find a segment close to the requested one
-            else if (window.packetHandler) {
-                const buffer = window.packetHandler.buffer[trackType];
-                const keys = Object.keys(buffer).map(Number).sort((a, b) => a - b);
-                
-                if (keys.length > 0) {
-                    // Try to find closest segment - better to use newer segments
-                    const closerKeys = keys.filter(k => Math.abs(k - segmentId) < 10);
-                    
-                    if (closerKeys.length > 0) {
-                        const closestId = closerKeys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId))[0];
-                        log(`🔄 Using closest segment: ${trackType} #${closestId} instead of #${segmentId}`);
-                        segmentData = buffer[closestId];
-                    } else {
-                        // Default to most recent segment
-                        const latestKey = keys[keys.length - 1];
-                        log(`🔄 Using latest segment: ${trackType} #${latestKey} instead of #${segmentId}`);
-                        segmentData = buffer[latestKey];
-                    }
+            // Then try by ID if we have that
+            if (this._trackId !== undefined && this._segmentId !== undefined && window.packetHandler) {
+                const trackType = this._trackId === 0 ? "video" : "audio";
+                if (window.packetHandler.buffer[trackType][this._segmentId]) {
+                    const segmentData = window.packetHandler.buffer[trackType][this._segmentId];
+                    serveSegmentData(this, segmentData, `segment-${this._trackId}-${this._segmentId}`);
+                    return;
                 }
             }
             
-            if (segmentData) {
-                log(`🎬 Serving segment: track=${trackId}, segment=${segmentId} (${segmentData.byteLength} bytes)`);
-                
-                setTimeout(() => {
-                    // IMPORTANT: Ensure using correct responseType
-                    this.responseType = 'arraybuffer';
-                    
-                    // Make sure we're serving an ArrayBuffer, not a TypedArray
-                    let buffer;
-                    if (segmentData instanceof Uint8Array) {
-                        buffer = segmentData.buffer.slice(
-                            segmentData.byteOffset, 
-                            segmentData.byteOffset + segmentData.byteLength
-                        );
-                    } else {
-                        buffer = segmentData;
-                    }
-                    
-                    // Set the correct response properties
-                    Object.defineProperty(this, 'response', { get: () => buffer });
-                    Object.defineProperty(this, 'status', { get: () => 200 });
-                    Object.defineProperty(this, 'statusText', { get: () => 'OK' });
-                    Object.defineProperty(this, 'readyState', { get: () => 4 });
-                    
-                    // Dispatch events to signal completion
-                    this.dispatchEvent(new Event('readystatechange'));
-                    this.dispatchEvent(new Event('load'));
-                    this.dispatchEvent(new Event('loadend'));
-                    
-                    log(`✅ Media segment served: track=${trackId}, segment=${segmentId}`);
-                }, 10);
-                
-                return;
-            } else {
-                log(`⚠️ No media segment available for track=${trackId}, segment=${segmentId}`);
-                // Respond with 404 to allow hls.js to retry
-                setTimeout(() => {
-                    Object.defineProperty(this, 'status', { get: () => 404 });
-                    Object.defineProperty(this, 'statusText', { get: () => 'Not Found' });
-                    Object.defineProperty(this, 'readyState', { get: () => 4 });
-                    
-                    this.dispatchEvent(new Event('readystatechange'));
-                    this.dispatchEvent(new Event('load'));
-                    this.dispatchEvent(new Event('loadend'));
-                }, 10);
-                
-                return;
-            }
+            // No segment found, respond with 404
+            log(`⚠️ No media segment found for: ${this._segmentName || this._url}`);
+            respondWith404(this);
+            return;
         }
         
         // Fall back to original XHR behavior for any unhandled requests
@@ -942,6 +881,45 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
     
     log(`✅ XHR interception setup completed for HLS.js`);
     return true;
+}
+
+// Helper function to serve segment data
+function serveSegmentData(xhr, data, segmentName) {
+    log(`🎬 Serving segment: ${segmentName} (${data.byteLength} bytes)`);
+    
+    setTimeout(() => {
+        xhr.responseType = 'arraybuffer';
+        let buffer;
+        if (data instanceof Uint8Array) {
+            buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+        } else {
+            buffer = data;
+        }
+        
+        Object.defineProperty(xhr, 'response', { get: () => buffer });
+        Object.defineProperty(xhr, 'status', { get: () => 200 });
+        Object.defineProperty(xhr, 'statusText', { get: () => 'OK' });
+        Object.defineProperty(xhr, 'readyState', { get: () => 4 });
+        
+        xhr.dispatchEvent(new Event('readystatechange'));
+        xhr.dispatchEvent(new Event('load'));
+        xhr.dispatchEvent(new Event('loadend'));
+        
+        log(`✅ Media segment served: ${segmentName}`);
+    }, 10);
+}
+
+// Helper function to respond with 404
+function respondWith404(xhr) {
+    setTimeout(() => {
+        Object.defineProperty(xhr, 'status', { get: () => 404 });
+        Object.defineProperty(xhr, 'statusText', { get: () => 'Not Found' });
+        Object.defineProperty(xhr, 'readyState', { get: () => 4 });
+        
+        xhr.dispatchEvent(new Event('readystatechange'));
+        xhr.dispatchEvent(new Event('load'));
+        xhr.dispatchEvent(new Event('loadend'));
+    }, 10);
 }
 
 function enhanceXHRInterception() {
