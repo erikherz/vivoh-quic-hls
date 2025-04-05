@@ -8,7 +8,7 @@
 // ─── Standard Library ───────────────────────────────────────────────────────────
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
-use std::collections::{VecDeque, HashSet};
+use std::collections::{VecDeque, HashSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -334,17 +334,45 @@ impl HlsReader {
         })
     }
 
+    /// Parse EXTINF durations from the playlist
+    fn parse_m3u8_durations(playlist_path: &PathBuf) -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+        let content = match fs::read_to_string(playlist_path) {
+            Ok(c) => c,
+            Err(_) => return map,
+        };
+
+        let mut last_extinf = None;
+        for line in content.lines() {
+            if line.starts_with("#EXTINF:") {
+                if let Some(duration_str) = line.split_once(":").map(|(_, v)| v.trim_end_matches(',')) {
+                    if let Ok(duration) = duration_str.parse::<f64>() {
+                        last_extinf = Some(duration);
+                    }
+                }
+            } else if line.ends_with(".ts") && last_extinf.is_some() {
+                let filename = line.trim().to_string();
+                map.insert(filename, last_extinf.unwrap());
+                last_extinf = None;
+            }
+        }
+
+        map
+    }
+
     async fn start_reading(mut self, tx: broadcast::Sender<WebTransportMediaPacket>) -> Result<(), VqdError> {
         const MAX_SEEN: usize = 10;
-        
+    
         loop {
+            let playlist_path = self.input_dir.join("playlist.m3u8");
+            let segment_durations = Self::parse_m3u8_durations(&playlist_path);
+    
             if tx.receiver_count() == 0 {
                 warn!("No receivers listening, waiting...");
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            
-            // Now we don't need to ensure initialization segments are loaded
+    
             // Scan for TS segments
             let mut segment_files = Vec::new();
             if let Ok(entries) = fs::read_dir(&self.input_dir) {
@@ -355,49 +383,43 @@ impl HlsReader {
                     }
                 }
             }
-            
+    
             // Sort segments by name to process in order
             segment_files.sort();
-            
+    
             if segment_files.is_empty() {
                 warn!("No TS segments found, waiting...");
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            
-            // Process each segment that we haven't seen yet
+    
             for path in segment_files {
                 let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                
-                // Try to extract sequence number from filename
-                let sequence_number = if let Some(captures) = Regex::new(r"(\d+)\.ts")
+    
+                // Use duration from parsed playlist or fallback to 2.0s
+                let duration = segment_durations.get(&filename).copied().unwrap_or(2.0);
+    
+                // Extract sequence number from filename
+                let sequence_number = Regex::new(r"(\d+)\.ts")
                     .ok()
-                    .and_then(|re| re.captures(&filename)) {
-                    if let Some(num_str) = captures.get(1) {
-                        num_str.as_str().parse::<u32>().unwrap_or(0)
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                };
-                
+                    .and_then(|re| re.captures(&filename))
+                    .and_then(|caps| caps.get(1))
+                    .and_then(|m| m.as_str().parse::<u32>().ok())
+                    .unwrap_or(0);
+    
                 if self.seen_segments.contains(&sequence_number) {
                     continue;
                 }
-                
-                // Add to tracking collections
+    
                 self.seen_queue.push_back(sequence_number);
                 self.seen_segments.insert(sequence_number);
-                
-                // Maintain a reasonable collection size
+    
                 if self.seen_queue.len() > MAX_SEEN {
                     if let Some(old) = self.seen_queue.pop_front() {
                         self.seen_segments.remove(&old);
                     }
                 }
-                
-                // Read the segment data
+    
                 let segment_data = match read_file(path.clone()) {
                     Ok(data) => data,
                     Err(e) => {
@@ -405,13 +427,10 @@ impl HlsReader {
                         continue;
                     }
                 };
-                
-                // Try to find the segment duration from the playlist - using fixed 2.0 as default
-                let duration = 2.0; // Default duration in seconds
-                
+    
                 let timestamp = (self.current_timestamp * 30_000.0) as u64;
                 let duration_ticks = (duration * 30_000.0) as u32;
-                
+    
                 let wmp = WebTransportMediaPacket {
                     packet_id: self.packet_id,
                     timestamp,
@@ -419,28 +438,26 @@ impl HlsReader {
                     segment_duration: duration as f32,
                     av_data: segment_data,
                 };
-                
+    
                 info!("WMP Packet Summary:");
                 info!("  packet_id        --> {}", wmp.packet_id);
-                info!("  timestamp        --> {} (raw: {})", 
+                info!("  timestamp        --> {} (raw: {})",
                       format_timestamp(self.current_timestamp), wmp.timestamp);
                 info!("  duration         --> {} ticks", wmp.duration);
                 info!("  segment_duration --> {} seconds", wmp.segment_duration);
                 info!("  av_data          --> {} bytes", wmp.av_data.len());
-                
-                // Send the packet to the channel
+    
                 if let Err(e) = tx.send(wmp) {
                     error!("Failed to send WMP to channel: {}", e);
                 }
-                
+    
                 self.current_timestamp += duration;
                 self.packet_id += 1;
             }
-            
-            // Sleep to avoid consuming too much CPU
+    
             sleep(Duration::from_secs(1)).await;
         }
-    }
+    }    
 }
 
 struct PipeReader {
