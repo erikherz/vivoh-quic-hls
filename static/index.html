@@ -422,22 +422,18 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
         .map(Number)
         .sort((a, b) => a - b);
     
-    if (videoSegments.length === 0) {
-        // Add a dummy segment if no segments are available yet
-        videoPlaylist += '#EXTINF:4.0,\n';
-        videoPlaylist += 'chunk-00000.ts\n'; // Changed to .ts extension
-    } else {
-        for (let i = 0; i < videoSegments.length; i++) {
-            const segId = videoSegments[i];
+        if (videoSegments.length === 0) {
+            // Add a dummy segment if no segments are available yet
             videoPlaylist += '#EXTINF:4.0,\n';
-            // Use the correct segment filename format matching your ffmpeg command
-            videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
+            videoPlaylist += 'chunk-00000.ts\n';  // Use .ts extension
+        } else {
+            for (let i = 0; i < videoSegments.length; i++) {
+                const segId = videoSegments[i];
+                videoPlaylist += '#EXTINF:4.0,\n';
+                // Match the format used in your ffmpeg command
+                videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
+            }
         }
-        
-        if (this.isDisconnected) {
-            videoPlaylist += '#EXT-X-ENDLIST\n';
-        }
-    }
     
     // Create blob URLs for the playlists
     const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
@@ -471,13 +467,16 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         return;
     }
     
-    // Enhanced fragment validation for MPEG-TS
-    // Check for TS sync byte (0x47) at the start of the packet
-    if (mediaData.byteLength > 0 && mediaData[0] === 0x47) {
+    // Check for TS sync byte (0x47) at the beginning
+    // MPEG-TS packets start with 0x47 (ASCII 'G')
+    const isMpegTs = mediaData.byteLength > 0 && mediaData[0] === 0x47;
+    
+    if (isMpegTs) {
         log(`🧩 Detected MPEG-TS packet for ${trackType} #${packetId}`);
-        // No need to modify TS packets, hls.js will handle remuxing
+        // No additional processing needed for TS packets
+        // hls.js will handle the remuxing to fMP4
     } else if (mediaData.byteLength >= 8) {
-        // This is likely an fMP4 segment, handle as before
+        // This is likely an fMP4 segment or something else
         const boxType = String.fromCharCode(
             mediaData[4], mediaData[5], mediaData[6], mediaData[7]
         );
@@ -487,7 +486,7 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         }
     }
     
-    // Add fragment to buffer with proper indexing (same for both TS and MP4)
+    // Add fragment to buffer with proper indexing
     this.buffer[trackType][packetId] = mediaData;
     
     // Also add to track-specific buffers for better organization
@@ -728,6 +727,19 @@ function setupXHRInterception() {
                     this._trackId = parseInt(match[1]);
                     this._segmentId = parseInt(match[2]);
                     log(`🎬 Media segment request: track=${this._trackId}, segment=${this._segmentId}`);
+                }
+            }
+            else if (url.includes('.ts') || url.match(/chunk-\d+\.ts/)) {
+                this._isMediaSegment = true;
+                
+                // Extract segment ID from URL pattern matching ffmpeg output
+                const matchSegment = url.match(/chunk-(\d+)\.ts/) || 
+                                    url.match(/chunk-(\d{5})\.ts/);
+                
+                if (matchSegment) {
+                    this._segmentId = parseInt(matchSegment[1]);
+                    this._trackId = 0; // Default to video track for TS segments
+                    log(`🎬 TS segment request: segment=${this._segmentId}`);
                 }
             }
             // External requests - don't intercept
