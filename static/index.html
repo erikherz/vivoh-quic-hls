@@ -1258,6 +1258,290 @@ function log(message) {
     logEl.scrollTop = logEl.scrollHeight;
     console.log(message);
 }
+
+/**
+ * Listen for incoming streams and process WebTransport data
+ */
+ async function listenToIncomingStreams(transport, packetHandler) {
+    // Reset stream counter
+    window.streamCounter = 0;
+    
+    try {
+        log("🎧 Listening for incoming streams...");
+        
+        // Handle readable streams from the server
+        const reader = transport.incomingUnidirectionalStreams.getReader();
+        
+        // Track active readers for cleanup
+        window.activeReaders = [];
+        
+        while (!window.disconnectionRequested) {
+            const { value: stream, done } = await reader.read();
+            
+            if (done) {
+                log("📢 Server finished sending streams");
+                break;
+            }
+            
+            // Increment stream counter
+            window.streamCounter++;
+            
+            // Handle this specific stream
+            handleIncomingStream(stream, packetHandler);
+        }
+    } catch (error) {
+        log(`❌ Error in stream listener: ${error.message}`);
+        if (!window.disconnectionRequested) {
+            // Only show error message if not intentionally disconnected
+            handleConnectionClosed();
+        }
+    }
+}
+
+/**
+ * Process an individual incoming stream
+ */
+async function handleIncomingStream(stream, packetHandler) {
+    const reader = stream.getReader();
+    window.activeReaders.push(reader);
+    
+    try {
+        log(`📥 Processing incoming stream #${window.streamCounter}`);
+        
+        while (!window.disconnectionRequested) {
+            const { value, done } = await reader.read();
+            
+            if (done) {
+                log(`📤 Stream #${window.streamCounter} ended`);
+                break;
+            }
+            
+            if (value && value.byteLength > 0) {
+                // Process WebTransport media packet
+                packetHandler.processWMPPacket(value);
+                
+                // Update UI counter
+                document.getElementById('packetCounter').textContent = 
+                    packetHandler.packetsReceived.toString();
+            }
+        }
+    } catch (error) {
+        log(`❌ Error reading stream: ${error.message}`);
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch (e) {
+            // Ignore errors during cleanup
+        }
+        
+        // Remove from active readers list
+        const index = window.activeReaders.indexOf(reader);
+        if (index !== -1) {
+            window.activeReaders.splice(index, 1);
+        }
+    }
+}
+
+/**
+ * Handle connection close events
+ */
+function handleConnectionClosed() {
+    log("🛑 Connection closed");
+    
+    // Update UI
+    document.getElementById('connectionStatus').textContent = "Disconnected";
+    document.getElementById('connectionStatus').className = "status-badge status-disconnected";
+    
+    // Re-enable connect button
+    document.getElementById('connectButton').disabled = false;
+    document.getElementById('playButton').disabled = true;
+    document.getElementById('disconnectButton').disabled = true;
+    
+    // Stop status updates
+    if (window.statusInterval) {
+        clearInterval(window.statusInterval);
+        window.statusInterval = null;
+    }
+    
+    // Clean up readers
+    window.activeReaders.forEach(reader => {
+        try { reader.releaseLock(); } catch (e) { /* Ignore */ }
+    });
+    window.activeReaders = [];
+    
+    // Stop video playback
+    if (window.player) {
+        try {
+            window.player.destroy();
+        } catch (e) {
+            log(`⚠️ Error destroying player: ${e.message}`);
+        }
+        window.player = null;
+    }
+    
+    // Reset packet handler
+    if (window.packetHandler) {
+        try {
+            window.packetHandler.disconnect();
+        } catch (e) {
+            log(`⚠️ Error disconnecting packet handler: ${e.message}`);
+        }
+        window.packetHandler = null;
+    }
+    
+    // Reset transport
+    if (window.transport) {
+        try {
+            window.transport.close();
+        } catch (e) {
+            log(`⚠️ Error closing transport: ${e.message}`);
+        }
+        window.transport = null;
+    }
+    
+    window.playerState = 'idle';
+    updateUI();
+}
+
+/**
+ * Update UI elements based on current state
+ */
+function updateUI() {
+    // Update connection status
+    const connectionStatus = document.getElementById('connectionStatus');
+    connectionStatus.textContent = window.transport ? "Connected" : "Disconnected";
+    connectionStatus.className = window.transport ? 
+        "status-badge status-connected" : "status-badge status-disconnected";
+    
+    // Update button states
+    document.getElementById('connectButton').disabled = !!window.transport;
+    document.getElementById('disconnectButton').disabled = !window.transport;
+    
+    // Update player status
+    const playerStatus = document.getElementById('playerStatus');
+    switch (window.playerState) {
+        case 'playing':
+            playerStatus.textContent = "Playing";
+            playerStatus.className = "status-badge status-connected";
+            break;
+        case 'paused':
+            playerStatus.textContent = "Paused";
+            playerStatus.className = "status-badge";
+            break;
+        case 'buffering':
+            playerStatus.textContent = "Buffering";
+            playerStatus.className = "status-badge status-buffering";
+            break;
+        case 'error':
+            playerStatus.textContent = "Error";
+            playerStatus.className = "status-badge status-disconnected";
+            break;
+        case 'ready':
+            playerStatus.textContent = "Ready";
+            playerStatus.className = "status-badge";
+            break;
+        default:
+            playerStatus.textContent = "Idle";
+            playerStatus.className = "status-badge";
+    }
+    
+    // Update buffer status if available
+    if (window.packetHandler) {
+        const stats = window.packetHandler.getStats();
+        document.getElementById('bufferStatus').textContent = 
+            `${stats.fragmentsAvailable} fragments`;
+    } else {
+        document.getElementById('bufferStatus').textContent = "0 fragments";
+    }
+    
+    // Update stream counter
+    document.getElementById('streamCounter').textContent = 
+        window.streamCounter ? window.streamCounter.toString() : "0";
+    
+    // Update packet counter
+    if (window.packetHandler) {
+        document.getElementById('packetCounter').textContent = 
+            window.packetHandler.packetsReceived.toString();
+    } else {
+        document.getElementById('packetCounter').textContent = "0";
+    }
+}
+
+/**
+ * Start periodic status updates
+ */
+function startStatusUpdates() {
+    if (window.statusInterval) {
+        clearInterval(window.statusInterval);
+    }
+    
+    window.statusInterval = setInterval(() => {
+        updateUI();
+    }, 1000);
+}
+
+// Set up event listeners for buttons
+document.addEventListener('DOMContentLoaded', function() {
+    // Connect button
+    document.getElementById('connectButton').addEventListener('click', async function() {
+        try {
+            const url = document.getElementById('wtUrl').value;
+            
+            if (!url || !url.startsWith('https://')) {
+                alert('Please enter a valid HTTPS WebTransport URL');
+                return;
+            }
+            
+            // Disable connect button while connecting
+            this.disabled = true;
+            log(`🔗 Connecting to ${url}...`);
+            
+            // Update UI to show connection in progress
+            document.getElementById('connectionStatus').textContent = "Connecting...";
+            
+            // Attempt to setup WebTransport connection
+            await setupWebTransport(url);
+            
+            // Update connection status
+            document.getElementById('connectionStatus').textContent = "Connected";
+            document.getElementById('connectionStatus').className = "status-badge status-connected";
+            
+            // Enable disconnect button
+            document.getElementById('disconnectButton').disabled = false;
+            
+        } catch (error) {
+            log(`❌ Connection failed: ${error.message}`);
+            this.disabled = false;
+            document.getElementById('connectionStatus').textContent = "Failed";
+            document.getElementById('connectionStatus').className = "status-badge status-disconnected";
+        }
+    });
+    
+    // Play button
+    document.getElementById('playButton').addEventListener('click', function() {
+        if (window.player) {
+            const videoElement = document.getElementById('videoElement');
+            videoElement.play().catch(err => {
+                log(`❌ Error playing: ${err.message}`);
+            });
+            log(`▶️ Playing video`);
+        } else {
+            log(`⚠️ Player not initialized yet`);
+        }
+    });
+    
+    // Disconnect button
+    document.getElementById('disconnectButton').addEventListener('click', function() {
+        window.disconnectionRequested = true;
+        log(`🔌 Disconnecting...`);
+        
+        handleConnectionClosed();
+    });
+    
+    // Initialize UI
+    updateUI();
+    log(`🚀 Player initialized and ready`);
+});
     </script>
 </body>
 </html>
