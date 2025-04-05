@@ -183,6 +183,13 @@ let streamCounter = 0;
 let bufferLoggingIntervals = [];
 window.blobUrlMap = new Map();
 
+window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
+    // Store with both the exact name and the ID-based key
+    window.blobUrlMap.set(segmentName, data);
+    window.blobUrlMap.set(`segment-${trackId}-${segmentId}`, data);
+    log(`🔗 Registered segment: ${segmentName}`);
+};
+
 /**
  * WebTransportHLSPacketHandler class
  * 
@@ -698,12 +705,6 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
         window.registerManifestBlobUrl = (url, manifestData) => {
             blobUrlMap.set(url, manifestData);
             log(`📄 Registered manifest blob URL: ${url}`);
-        };
-        
-        // Add method to register media segments
-        window.registerMediaSegment = (trackId, segmentId, data) => {
-            const key = `segment-${trackId}-${segmentId}`;
-            blobUrlMap.set(key, data);
         };
         
         // Override open method to track request type
