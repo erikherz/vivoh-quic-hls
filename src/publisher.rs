@@ -350,14 +350,23 @@ impl HlsReader {
     async fn ensure_init_segments_loaded(&mut self) -> Result<bool, VqdError> {
         // For HLS with fMP4, initialization segments are specified by the EXT-X-MAP tag
         // We'll first try to find and parse the master playlist
-        let master_playlist_path = self.find_master_playlist()?;
+        let master_playlist_path_opt = self.find_master_playlist()?;
+        
+        // If no master playlist is found, return false to indicate we need to wait
+        let master_playlist_path = match master_playlist_path_opt {
+            Some(path) => path,
+            None => {
+                debug!("No master playlist found. Waiting for files to appear.");
+                return Ok(false);
+            }
+        };
         
         // If we already have the init segments, no need to continue
         if self.audio_init.is_some() && self.video_init.is_some() {
             return Ok(true);
         }
         
-        // Try to find the variant playlists from the master playlist
+        // Rest of the method remains the same, but use master_playlist_path directly
         let master_playlist_content = match read_file(master_playlist_path) {
             Ok(data) => {
                 match std::str::from_utf8(&data) {
@@ -577,7 +586,16 @@ impl HlsReader {
         // For each segment, we look for the 'ftyp' and 'moov' boxes that form the init section
         
         // First, properly find and parse all playlists
-        let master_playlist_path = self.find_master_playlist()?;
+        let master_playlist_path_opt = self.find_master_playlist()?;
+        
+        // If no master playlist is found, return false to indicate we need to wait
+        let master_playlist_path = match master_playlist_path_opt {
+            Some(path) => path,
+            None => {
+                debug!("No master playlist found. Waiting for files to appear.");
+                return Ok(false);
+            }
+        };
         
         // Read the master playlist
         let master_content = match read_file(master_playlist_path.clone()) {
@@ -875,10 +893,22 @@ impl HlsReader {
             }
             
             // Ensure init segments are loaded
-            if !self.ensure_init_segments_loaded().await? {
-                warn!("Waiting for initialization segments...");
-                sleep(Duration::from_secs(1)).await;
-                continue;
+            match self.ensure_init_segments_loaded().await {
+                Ok(true) => {
+                    // Init segments loaded successfully, continue processing
+                },
+                Ok(false) => {
+                    // No master playlist or init segments yet, wait and retry
+                    warn!("Waiting for HLS files to appear in {}...", self.input_dir.display());
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                },
+                Err(e) => {
+                    // Actual error occurred, log and wait
+                    warn!("Error loading initialization segments: {}, retrying in 5 seconds...", e);
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
             
             // Find available segment numbers for HLS
@@ -1023,7 +1053,7 @@ impl HlsReader {
         }
     }
 
-    fn find_master_playlist(&self) -> Result<PathBuf, VqdError> {
+    fn find_master_playlist(&self) -> Result<Option<PathBuf>, VqdError> {
         // Common names for master playlists
         let possible_names = [
             "master.m3u8",
@@ -1035,29 +1065,33 @@ impl HlsReader {
         for name in &possible_names {
             let path = self.input_dir.join(name);
             if path.exists() {
-                return Ok(path);
+                return Ok(Some(path));
             }
         }
         
         // If no standard name is found, look for any .m3u8 file
-        for entry in fs::read_dir(&self.input_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "m3u8") {
-                // Read a bit of the file to see if it looks like a master playlist
-                let mut file = fs::File::open(&path)?;
-                let mut buffer = [0; 100]; // Read first 100 bytes
-                let n = file.read(&mut buffer)?;
-                let content = String::from_utf8_lossy(&buffer[..n]);
-                
-                // Check if it contains variant streams (#EXT-X-STREAM-INF)
-                if content.contains("#EXT-X-STREAM-INF") {
-                    return Ok(path);
+        if let Ok(entries) = fs::read_dir(&self.input_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "m3u8") {
+                    // Read a bit of the file to see if it looks like a master playlist
+                    if let Ok(mut file) = fs::File::open(&path) {
+                        let mut buffer = [0; 100]; // Read first 100 bytes
+                        if let Ok(n) = file.read(&mut buffer) {
+                            let content = String::from_utf8_lossy(&buffer[..n]);
+                            
+                            // Check if it contains variant streams (#EXT-X-STREAM-INF)
+                            if content.contains("#EXT-X-STREAM-INF") {
+                                return Ok(Some(path));
+                            }
+                        }
+                    }
                 }
             }
         }
         
-        Err(VqdError::Other("No master playlist found".to_string()))
+        // No master playlist found, but don't error out, just return None
+        Ok(None)
     }
     
     fn parse_master_playlist(&self, playlist: &str) -> Result<Vec<String>, VqdError> {

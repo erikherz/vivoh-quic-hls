@@ -11,7 +11,7 @@ Server Command:
 
 Publisher Command:
 ```
-./vqh-publisher --input /path/to/hls --server https://your.vqd-server.com
+./vqh-publisher --input /path/to/hls --server https://your.vqd-server.com/live/pub
 ```
 
 Encoder Command:
