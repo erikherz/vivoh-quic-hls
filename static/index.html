@@ -425,58 +425,63 @@ WebTransportHLSPacketHandler.prototype._processHLSData = function(data) {
 WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     // Create a basic master playlist
     let masterPlaylist = '#EXTM3U\n';
-    masterPlaylist += '#EXT-X-VERSION:3\n'; // Use version 3 for better compatibility
-    
-    // Add video variant
-    masterPlaylist += '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.42c01e,mp4a.40.2"\n';
-    masterPlaylist += 'video.m3u8\n';
+    masterPlaylist += '#EXT-X-VERSION:3\n';
     
     // Create a video media playlist
     let videoPlaylist = '#EXTM3U\n';
     videoPlaylist += '#EXT-X-VERSION:3\n';
     videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
-    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n'; // Start from 0
+    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     
     // Add segment entries for video
     const videoSegments = Object.keys(this.buffer.video)
         .map(Number)
         .sort((a, b) => a - b);
     
-    // Set an appropriate duration (use 2 or 4 seconds)
-    const segmentDuration = 4.0;
-    
-    for (let i = 0; i < videoSegments.length; i++) {
-        const segId = videoSegments[i];
-        videoPlaylist += `#EXTINF:${segmentDuration.toFixed(1)},\n`;
-        videoPlaylist += `chunk_0_${segId}.m4s\n`;
-    }
-    
     if (videoSegments.length === 0) {
         // Add a dummy segment if no segments are available yet
-        // This prevents the "levelParsingError" when the player tries to load an empty playlist
         videoPlaylist += '#EXTINF:4.0,\n';
         videoPlaylist += 'chunk_0_init.m4s\n';
-    } else if (this.isDisconnected) {
-        // Only mark as ended if we have a complete stream
-        videoPlaylist += '#EXT-X-ENDLIST\n';
+    } else {
+        for (let i = 0; i < videoSegments.length; i++) {
+            const segId = videoSegments[i];
+            videoPlaylist += '#EXTINF:4.0,\n';
+            videoPlaylist += `chunk_0_${segId}.m4s\n`;
+        }
+        
+        if (this.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
+        }
     }
-    
-    // Store the generated master playlist
-    this.hlsData = masterPlaylist;
     
     // Create blob URLs for the playlists
-    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    const videoPlaylistUrl = URL.createObjectURL(videoBlob);
     
+    // Now reference the full video playlist URL in the master playlist
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.42c01e,mp4a.40.2"\n`;
+    masterPlaylist += `${videoPlaylistUrl}\n`;
+    
+    // Create the master playlist blob
+    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     this.hlsUrl = URL.createObjectURL(masterBlob);
     
-    // Register all playlists for XHR interception
-    if (typeof window.registerManifestBlobUrl === 'function') {
-        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
-        window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
+    // Make sure blobUrlMap is defined globally
+    if (!window.blobUrlMap) {
+        window.blobUrlMap = new Map();
     }
     
-    log(`✅ Generated HLS manifests and registered blob URLs`);
+    // Register all playlists for XHR interception
+    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
+    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
+    
+    // Also use the registerManifestBlobUrl function if available
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
+    }
+    
+    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
     
     // Notify that the HLS is ready
     if (typeof this.onHLSReady === 'function') {
