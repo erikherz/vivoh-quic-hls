@@ -1195,6 +1195,24 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             maxBufferHole: 2,
             maxStarvationDelay: 8000
         });
+
+        if (videoElement) {
+            videoElement.addEventListener('error', (e) => {
+                log(`❌ Video element error: ${videoElement.error?.code}, ${videoElement.error?.message}`);
+            });
+            
+            videoElement.addEventListener('canplay', () => {
+                log(`✅ Video can play`);
+            });
+            
+            videoElement.addEventListener('playing', () => {
+                log(`▶️ Video started playing`);
+            });
+            
+            videoElement.addEventListener('stalled', () => {
+                log(`⏸️ Video playback stalled`);
+            });
+        }
         
         // Set up event listeners with improved logging
         hls.on(Hls.Events.MEDIA_ATTACHED, () => {
@@ -1214,6 +1232,31 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
                     log(`📄 Level ${index}: ${level.url}`);
                 });
             }
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+            log(`❌ HLS.js error: Type=${data.type}, Details=${data.details}, Fatal=${data.fatal}`);
+            console.error("Error data:", data);
+            
+            if (data.response) {
+                log(`❌ Response error: Status=${data.response.code}, URL=${data.response.url}`);
+            }
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+            log(`✅ Fragment loaded: ${data.frag.url}, size=${data.frag.loaded} bytes`);
+        });
+
+        hls.on(Hls.Events.FRAG_LOADING_ERROR, (event, data) => {
+            log(`❌ Fragment loading error: ${data.frag.url}, Details=${data.details}`);
+        });
+
+        hls.on(Hls.Events.FRAG_PARSING_ERROR, (event, data) => {
+            log(`❌ Fragment parsing error: ${data.frag.url}, Details=${data.details}`);
+        });
+
+        hls.on(Hls.Events.FRAG_DECRYPTION_ERROR, (event, data) => {
+            log(`❌ Fragment decryption error: ${data.frag.url}, Details=${data.details}`);
         });
 
         hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
@@ -1285,11 +1328,9 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
 function setupPacketHandlerCallbacks() {
     if (!window.packetHandler) return;
     
-    // Override the onHLSReady callback with improved player initialization
     window.packetHandler.onHLSReady = (hlsUrl) => {
         log(`📄 HLS ready for playback: ${hlsUrl}`);
         
-        // Use the improved player initialization
         if (!window.player) {
             initializeHLSPlayer(hlsUrl);
         } else {
