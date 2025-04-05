@@ -263,11 +263,6 @@ class WebTransportHLSPacketHandler {
             this.lastProcessedPacketId = packetId;
             this.packetsReceived++;
             
-            // Extract manifest data (using MPD field for HLS data)
-            if (!this.hlsData && fields.mpd.byteLength > 0) {
-                this._processHLSData(fields.mpd);
-            }
-            
             // Extract initialization segments
             if (!this.init.audio && fields.audioInit.byteLength > 0) {
                 this.init.audio = fields.audioInit;
@@ -303,6 +298,11 @@ class WebTransportHLSPacketHandler {
             
             // Check if we have enough data to start playback
             this._checkPlaybackReadiness();
+
+            // Generate manifest after receiving a few packets if we don't have one yet
+            if (!this.hlsData && this.packetsReceived >= 3) {
+                this._generateHLSManifest();
+            }
             
             return true;
         } catch (error) {
@@ -331,54 +331,38 @@ class WebTransportHLSPacketHandler {
         }
     }
 }
-    /**
- * WebTransport HLS.js Player - Part 2: Media Processing
- */
 
-// Continue WebTransportHLSPacketHandler class methods
 WebTransportHLSPacketHandler.prototype._extractPacketHeader = function(dataArray) {
     const view = new DataView(dataArray.buffer, dataArray.byteOffset, dataArray.byteLength);
     
-    // Extract header fields
+    // Extract header fields that are actually in your packet
     const packetId = view.getUint32(0);
     const timestamp = view.getBigUint64(4);
     const duration = view.getUint32(12);
     
-    // Extract field lengths
-    const mpdLength = view.getUint32(16);
-    const audioInitLength = view.getUint32(20);
-    const videoInitLength = view.getUint32(24);
-    const audioDataLength = view.getUint32(28);
-    const videoDataLength = view.getUint32(32);
+    // New field in your structure
+    const segmentDuration = view.getFloat32(16);
     
-    // Calculate field positions
-    let position = 36;  // Start after header and field lengths
+    // The rest of the data is just the AV data
+    const avData = dataArray.slice(20); // Starting position after the header
     
-    // Extract each field
-    const mpd = dataArray.slice(position, position + mpdLength);
-    position += mpdLength;
-    
-    const audioInit = dataArray.slice(position, position + audioInitLength);
-    position += audioInitLength;
-    
-    const videoInit = dataArray.slice(position, position + videoInitLength);
-    position += videoInitLength;
-    
-    const audioData = dataArray.slice(position, position + audioDataLength);
-    position += audioDataLength;
-    
-    const videoData = dataArray.slice(position, position + videoDataLength);
-    
+    // For compatibility with your existing code, map this to the fields your
+    // code expects, but with most being empty except the media data
     return {
         packetId,
         timestamp,
         duration,
+        segmentDuration, // New field
         fields: {
-            mpd,
-            audioInit,
-            videoInit,
-            audioData,
-            videoData
+            // These fields don't exist in your actual packet, set them to empty
+            mpd: new Uint8Array(0),
+            audioInit: new Uint8Array(0),
+            videoInit: new Uint8Array(0),
+            
+            // Place all AV data in videoData for now
+            // (or you might need to handle this differently based on your implementation)
+            audioData: new Uint8Array(0), 
+            videoData: avData
         }
     };
 };
