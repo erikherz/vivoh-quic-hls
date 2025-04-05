@@ -392,81 +392,84 @@ WebTransportHLSPacketHandler.prototype._processHLSData = function(data) {
     }
 };
 
-    // In your _generateHLSManifest function, add more detailed logging:
-    WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
-        // Create a basic master playlist
-        let masterPlaylist = '#EXTM3U\n';
-        masterPlaylist += '#EXT-X-VERSION:3\n';
-        
-        // Create a video media playlist
-        let videoPlaylist = '#EXTM3U\n';
-        videoPlaylist += '#EXT-X-VERSION:3\n';
-        videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match ffmpeg -hls_time 1
-        videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
-        
-        // Add segment entries for video
-        const videoSegments = Object.keys(this.buffer.video)
-            .map(Number)
-            .sort((a, b) => a - b);
-        
-        if (videoSegments.length === 0) {
-            // Add a dummy segment if no segments are available yet
-            videoPlaylist += '#EXTINF:1.0,\n';
-            videoPlaylist += 'chunk-00000.ts\n'; // Match ffmpeg naming pattern
-        } else {
-            for (let i = 0; i < videoSegments.length; i++) {
-                const segId = videoSegments[i];
-                // Use segmentDuration if available, otherwise default to 1.0
-                const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
-                videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
-                const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
-                videoPlaylist += `${segmentName}\n`;
-                window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
-            }
-            
-            if (this.isDisconnected) {
-                videoPlaylist += '#EXT-X-ENDLIST\n';
-            }
+WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
+    // Create a basic master playlist
+    let masterPlaylist = '#EXTM3U\n';
+    masterPlaylist += '#EXT-X-VERSION:3\n';
+    
+    // Create a video media playlist
+    let videoPlaylist = '#EXTM3U\n';
+    videoPlaylist += '#EXT-X-VERSION:3\n';
+    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match ffmpeg -hls_time 1
+    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
+    
+    // Add segment entries for video
+    const videoSegments = Object.keys(this.buffer.video)
+        .map(Number)
+        .sort((a, b) => a - b);
+    
+    if (videoSegments.length === 0) {
+        // Add a dummy segment if no segments are available yet
+        videoPlaylist += '#EXTINF:1.0,\n';
+        videoPlaylist += 'chunk-00000.ts\n'; // Match ffmpeg naming pattern
+    } else {
+        for (let i = 0; i < videoSegments.length; i++) {
+            const segId = videoSegments[i];
+            // Use segmentDuration if available, otherwise default to 1.0
+            const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
+            videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
+            const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
+            videoPlaylist += `${segmentName}\n`;
+            window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
         }
         
-        console.log("GENERATED VIDEO PLAYLIST:", videoPlaylist);
-        
-        // Create blob URLs for the playlists
-        const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
-        const videoPlaylistUrl = URL.createObjectURL(videoBlob);
-        
-        // Now reference the full video playlist URL in the master playlist
-        masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
-        masterPlaylist += `${videoPlaylistUrl}\n`;
-        
-        console.log("GENERATED MASTER PLAYLIST:", masterPlaylist);
-        
-        // Create the master playlist blob
-        const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
-        this.hlsUrl = URL.createObjectURL(masterBlob);
-        
-        // Make sure blobUrlMap is defined globally
-        if (!window.blobUrlMap) {
-            window.blobUrlMap = new Map();
+        if (this.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
         }
-        
-        // Register all playlists for XHR interception
-        window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
-        window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
-        
-        // Also use the registerManifestBlobUrl function if available
-        if (typeof window.registerManifestBlobUrl === 'function') {
-            window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
-            window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
-        }
-        
-        log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
-        
-        // Notify that the HLS is ready
-        if (typeof this.onHLSReady === 'function') {
-            this.onHLSReady(this.hlsUrl);
-        }
-    };
+    }
+    
+    // Log full video playlist content to both console and UI
+    console.log("GENERATED VIDEO PLAYLIST:", videoPlaylist);
+    log(`📄 VIDEO PLAYLIST CONTENT:\n${videoPlaylist}`);
+    
+    // Create blob URLs for the playlists
+    const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    const videoPlaylistUrl = URL.createObjectURL(videoBlob);
+    
+    // Now reference the full video playlist URL in the master playlist
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
+    masterPlaylist += `${videoPlaylistUrl}\n`;
+    
+    // Log full master playlist content to both console and UI
+    console.log("GENERATED MASTER PLAYLIST:", masterPlaylist);
+    log(`📄 MASTER PLAYLIST CONTENT:\n${masterPlaylist}`);
+    
+    // Create the master playlist blob
+    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
+    this.hlsUrl = URL.createObjectURL(masterBlob);
+    
+    // Make sure blobUrlMap is defined globally
+    if (!window.blobUrlMap) {
+        window.blobUrlMap = new Map();
+    }
+    
+    // Register all playlists for XHR interception
+    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
+    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
+    
+    // Also use the registerManifestBlobUrl function if available
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
+    }
+    
+    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
+    
+    // Notify that the HLS is ready
+    if (typeof this.onHLSReady === 'function') {
+        this.onHLSReady(this.hlsUrl);
+    }
+};
 
 WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     // Only update occasionally to avoid excessive regeneration
@@ -770,6 +773,7 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
             log(`📄 Serving registered manifest blob from map (${this._url})`);
             
             const manifestData = blobUrlMap.get(this._url);
+            log(`📄 MANIFEST BLOB CONTENT:\n${manifestData}`);            
             
             setTimeout(() => {
                 this.responseType = 'text';
@@ -792,6 +796,7 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
         // HLS Manifest Request
         if (this._isManifestRequest && window.packetHandler?.hlsData) {
             log(`📄 Serving HLS manifest from WebTransport packet (${window.packetHandler.hlsData.length} bytes)`);
+            log(`📄 M3U8 CONTENT:\n${window.packetHandler.hlsData}`);
             
             setTimeout(() => {
                 this.responseType = 'text';
@@ -1007,6 +1012,8 @@ function enhanceXHRInterception() {
     XMLHttpRequest.prototype.send = function(body) {
         if (this._isManifestRequest && window.packetHandler?.hlsData) {
             log(`📄 Serving HLS manifest from WebTransport packet`);
+
+            log(`📄 M3U8 CONTENT BEING SERVED:\n${window.packetHandler.hlsData}`);
             console.log("M3U8 CONTENT BEING SERVED:", window.packetHandler.hlsData);
             
             setTimeout(() => {
@@ -1032,10 +1039,11 @@ function enhanceXHRInterception() {
     };
     
     if (this._isManifestBlobUrl && blobUrlMap.has(this._url)) {
-    log(`📄 Serving registered manifest blob from map (${this._url})`);
-    
-    const manifestData = blobUrlMap.get(this._url);
-    console.log("M3U8 BLOB CONTENT BEING SERVED:", manifestData);
+        log(`📄 Serving registered manifest blob from map (${this._url})`);
+        
+        const manifestData = blobUrlMap.get(this._url);
+        log(`📄 M3U8 BLOB CONTENT BEING SERVED:\n${manifestData}`);
+        console.log("M3U8 BLOB CONTENT BEING SERVED:", manifestData);    
     
     setTimeout(() => {
             this.responseType = 'text';
@@ -1144,6 +1152,20 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             hls.loadSource(hlsUrl);
         });
         
+        hls.on(Hls.Events.MANIFEST_LOADING, (event, data) => {
+            log(`📄 Loading HLS manifest: ${data.url}`);
+        });
+
+        hls.on(Hls.Events.MANIFEST_LOADED, (event, data) => {
+            log(`📄 HLS manifest loaded: ${data.url}`);
+            if (data.levels && data.levels.length > 0) {
+                log(`📄 HLS manifest contains ${data.levels.length} levels`);
+                data.levels.forEach((level, index) => {
+                    log(`📄 Level ${index}: ${level.url}`);
+                });
+            }
+        });
+
         hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
             log(`📄 HLS manifest parsed: ${data.levels.length} quality levels`);
             window.playerState = 'ready';
@@ -1303,7 +1325,7 @@ function setupPacketHandlerCallbacks() {
 /**
  * Simple logging function that outputs to both console and UI
  */
-function log(message) {
+ function log(message) {
     const logEl = document.getElementById('logcatbox');
     if (!logEl) {
         console.log(message);
@@ -1311,9 +1333,22 @@ function log(message) {
     }
     
     const time = new Date().toISOString().split('T')[1].split('.')[0];
-    const formattedMessage = `[${time}] ${message}`;
     
-    logEl.value += formattedMessage + '\n';
+    // Handle multi-line messages (like M3U8 content)
+    if (message.includes('\n')) {
+        const lines = message.split('\n');
+        const firstLine = `[${time}] ${lines[0]}`;
+        logEl.value += firstLine + '\n';
+        
+        // Indent subsequent lines for better readability
+        for (let i = 1; i < lines.length; i++) {
+            logEl.value += `        ${lines[i]}\n`;
+        }
+    } else {
+        const formattedMessage = `[${time}] ${message}`;
+        logEl.value += formattedMessage + '\n';
+    }
+    
     logEl.scrollTop = logEl.scrollHeight;
     console.log(message);
 }
