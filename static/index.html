@@ -239,19 +239,21 @@ class WebTransportHLSPacketHandler {
             // Convert data to Uint8Array if needed
             const dataArray = this._ensureUint8Array(data);
             
-            // Validate minimum packet size
-            if (dataArray.length < 36) {
-                log(`⚠️ Packet too small: ${dataArray.length} bytes (minimum 36 required)`);
+            // Validate minimum packet size (20 bytes for header)
+            if (dataArray.length < 20) {
+                log(`⚠️ Packet too small: ${dataArray.length} bytes (minimum 20 required)`);
                 return false;
             }
             
-            // Parse the header and get fields
-            const {
-                packetId,
-                timestamp,
-                duration,
-                fields
-            } = this._extractPacketHeader(dataArray);
+            // Parse the header according to WebTransportMediaPacket structure
+            const view = new DataView(dataArray.buffer, dataArray.byteOffset, dataArray.byteLength);
+            const packetId = view.getUint32(0);          // 4 bytes: u32
+            const timestamp = view.getBigUint64(4);      // 8 bytes: u64
+            const duration = view.getUint32(12);         // 4 bytes: u32
+            const segmentDuration = view.getFloat32(16); // 4 bytes: f32
+            
+            // The AV data starts at byte 20
+            const avData = dataArray.slice(20);
             
             // Check for duplicate packets
             if (packetId === this.lastProcessedPacketId) {
@@ -263,37 +265,23 @@ class WebTransportHLSPacketHandler {
             this.lastProcessedPacketId = packetId;
             this.packetsReceived++;
             
-            // Extract initialization segments
-            if (!this.init.audio && fields.audioInit.byteLength > 0) {
-                this.init.audio = fields.audioInit;
-                log(`✅ Extracted audio init segment (${fields.audioInit.byteLength} bytes)`);
-            }
-            
-            if (!this.init.video && fields.videoInit.byteLength > 0) {
-                this.init.video = fields.videoInit;
-                log(`✅ Extracted video init segment (${fields.videoInit.byteLength} bytes)`);
-            }
-            
-            // Process media fragments
-            if (fields.audioData.byteLength > 0) {
-                this._processMediaFragment(1, packetId, fields.audioData, false);
-            }
-            
-            if (fields.videoData.byteLength > 0) {
-                this._processMediaFragment(0, packetId, fields.videoData, true);
+            // For MPEG-TS streams, we don't need initialization segments
+            // Process the AV data directly as a video fragment
+            if (avData.byteLength > 0) {
+                this._processMediaFragment(0, packetId, avData, true, segmentDuration);
             }
             
             // Log periodic stats
             if (this.packetsReceived % 10 === 0) {
                 const tsSeconds = Number(timestamp) / 1000000; // Convert microseconds to seconds
                 log(`📈 Packet stats: Received=${this.packetsReceived}, ` +
-                    `TS=${tsSeconds.toFixed(3)}s, Duration=${duration}ms, ` +
+                    `TS=${tsSeconds.toFixed(3)}s, Duration=${duration}ms, SegDuration=${segmentDuration}s, ` +
                     `Buffer size: V=${Object.keys(this.buffer.video).length}, ` +
                     `A=${Object.keys(this.buffer.audio).length}`);
             }
             
             // Update stats
-            this.fragmentsReceived += 2; // Audio and video
+            this.fragmentsReceived++;
             this.bytesReceived += dataArray.byteLength;
             
             // Check if we have enough data to start playback
@@ -335,35 +323,25 @@ class WebTransportHLSPacketHandler {
 WebTransportHLSPacketHandler.prototype._extractPacketHeader = function(dataArray) {
     const view = new DataView(dataArray.buffer, dataArray.byteOffset, dataArray.byteLength);
     
-    // Extract header fields that are actually in your packet
-    const packetId = view.getUint32(0);
-    const timestamp = view.getBigUint64(4);
-    const duration = view.getUint32(12);
+    // Extract fields according to WebTransportMediaPacket structure
+    const packetId = view.getUint32(0);           // 4 bytes: u32
+    const timestamp = view.getBigUint64(4);       // 8 bytes: u64
+    const duration = view.getUint32(12);          // 4 bytes: u32
+    const segmentDuration = view.getFloat32(16);  // 4 bytes: f32
     
-    // New field in your structure
-    const segmentDuration = view.getFloat32(16);
+    // The AV data starts at byte 20
+    const avData = dataArray.slice(20);
     
-    // The rest of the data is just the AV data
-    const avData = dataArray.slice(20); // Starting position after the header
+    // Check if this is a MPEG-TS packet (should start with 0x47 sync byte)
+    const isMpegTs = avData.byteLength > 0 && avData[0] === 0x47;
     
-    // For compatibility with your existing code, map this to the fields your
-    // code expects, but with most being empty except the media data
     return {
         packetId,
         timestamp,
         duration,
-        segmentDuration, // New field
-        fields: {
-            // These fields don't exist in your actual packet, set them to empty
-            mpd: new Uint8Array(0),
-            audioInit: new Uint8Array(0),
-            videoInit: new Uint8Array(0),
-            
-            // Place all AV data in videoData for now
-            // (or you might need to handle this differently based on your implementation)
-            audioData: new Uint8Array(0), 
-            videoData: avData
-        }
+        segmentDuration,
+        isMpegTs,
+        mediaData: avData
     };
 };
 
@@ -414,7 +392,7 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     // Create a video media playlist
     let videoPlaylist = '#EXTM3U\n';
     videoPlaylist += '#EXT-X-VERSION:3\n';
-    videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
+    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match your ffmpeg -hls_time 1
     videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     
     // Add segment entries for video
@@ -422,32 +400,58 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
         .map(Number)
         .sort((a, b) => a - b);
     
-        if (videoSegments.length === 0) {
-            // Add a dummy segment if no segments are available yet
-            videoPlaylist += '#EXTINF:4.0,\n';
-            videoPlaylist += 'chunk-00000.ts\n';  // Use .ts extension
-        } else {
-            for (let i = 0; i < videoSegments.length; i++) {
-                const segId = videoSegments[i];
-                videoPlaylist += '#EXTINF:4.0,\n';
-                // Match the format used in your ffmpeg command
-                videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
-            }
+    if (videoSegments.length === 0) {
+        // Add a dummy segment if no segments are available yet
+        videoPlaylist += '#EXTINF:1.0,\n';
+        videoPlaylist += 'chunk-00000.ts\n'; // Match ffmpeg naming pattern
+    } else {
+        for (let i = 0; i < videoSegments.length; i++) {
+            const segId = videoSegments[i];
+            // Use segmentDuration if available, otherwise default to 1.0
+            const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
+            videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
+            // Match the format from your ffmpeg command
+            videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
         }
+        
+        if (this.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
+        }
+    }
     
     // Create blob URLs for the playlists
     const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
     const videoPlaylistUrl = URL.createObjectURL(videoBlob);
     
     // Now reference the full video playlist URL in the master playlist
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.42c01e,mp4a.40.2"\n`;
+    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
     masterPlaylist += `${videoPlaylistUrl}\n`;
     
     // Create the master playlist blob
     const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     this.hlsUrl = URL.createObjectURL(masterBlob);
     
-    // Rest of your code...
+    // Make sure blobUrlMap is defined globally
+    if (!window.blobUrlMap) {
+        window.blobUrlMap = new Map();
+    }
+    
+    // Register all playlists for XHR interception
+    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
+    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
+    
+    // Also use the registerManifestBlobUrl function if available
+    if (typeof window.registerManifestBlobUrl === 'function') {
+        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
+    }
+    
+    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
+    
+    // Notify that the HLS is ready
+    if (typeof this.onHLSReady === 'function') {
+        this.onHLSReady(this.hlsUrl);
+    }
 };
 
 WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
@@ -459,7 +463,16 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     log(`🔄 Updated HLS manifests with new fragments`);
 };
 
-WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId, packetId, mediaData, isVideo) {
+/**
+ * Process a media fragment from a WebTransport packet
+ * 
+ * @param {number} trackId - The track ID (0 for video, 1 for audio)
+ * @param {number} packetId - The packet ID
+ * @param {Uint8Array} mediaData - The media data
+ * @param {boolean} isVideo - Whether this is video data
+ * @param {number} segmentDuration - The segment duration in seconds
+ */
+ _processMediaFragment(trackId, packetId, mediaData, isVideo, segmentDuration = 1.0) {
     const trackType = isVideo ? "video" : "audio";
     
     // Skip empty fragments
@@ -467,47 +480,61 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         return;
     }
     
-    // Check for TS sync byte (0x47) at the beginning
-    // MPEG-TS packets start with 0x47 (ASCII 'G')
+    // MPEG-TS detection - check for sync byte 0x47 ('G' in ASCII)
     const isMpegTs = mediaData.byteLength > 0 && mediaData[0] === 0x47;
     
     if (isMpegTs) {
         log(`🧩 Detected MPEG-TS packet for ${trackType} #${packetId}`);
-        // No additional processing needed for TS packets
-        // hls.js will handle the remuxing to fMP4
-    } else if (mediaData.byteLength >= 8) {
-        // This is likely an fMP4 segment or something else
-        const boxType = String.fromCharCode(
-            mediaData[4], mediaData[5], mediaData[6], mediaData[7]
-        );
         
-        if (packetId % 10 === 0) {
-            log(`🧪 Fragment ${packetId} (${trackType}) starts with box: ${boxType}`);
+        // Check for multiple TS packets (each should be 188 bytes)
+        if (mediaData.byteLength >= 188) {
+            const packetCount = Math.floor(mediaData.byteLength / 188);
+            if (packetId % 10 === 0) {
+                log(`📊 Contains ${packetCount} TS packets, total size=${mediaData.byteLength}B`);
+            }
+        }
+    } else if (mediaData.byteLength >= 8) {
+        // Not a TS packet, but log what we received
+        try {
+            const boxType = String.fromCharCode(
+                mediaData[4], mediaData[5], mediaData[6], mediaData[7]
+            );
+            
+            if (packetId % 10 === 0) {
+                log(`🧪 Fragment ${packetId} (${trackType}) starts with box: ${boxType}`);
+            }
+        } catch (e) {
+            // If we can't extract box type, just log packet type
+            log(`📦 Non-TS fragment ${packetId} received`);
         }
     }
     
-    // Add fragment to buffer with proper indexing
+    // Add fragment to buffer regardless of type
     this.buffer[trackType][packetId] = mediaData;
     
-    // Also add to track-specific buffers for better organization
+    // Add to track-specific buffers
     if (!this.trackBuffers[trackId]) {
         this.trackBuffers[trackId] = { fragments: [], lastSequence: -1 };
     }
     
-    // Add to fragments array with sequence info
+    // Add to fragments array with sequence info and segment duration
     this.trackBuffers[trackId].fragments.push({
         sequence: packetId,
         data: mediaData,
-        isKeyframe: isVideo, // For simplicity, treat all video fragments as keyframes
-        timestamp: Date.now()
+        isKeyframe: true, // For MPEG-TS segments, treat all as keyframes
+        timestamp: Date.now(),
+        isMpegTs: isMpegTs,
+        segmentDuration: segmentDuration // Store segment duration from packet
     });
     
-    // Register the media segment in the XHR interception map if available
+    // Register the media segment for XHR interception
     if (typeof window.registerMediaSegment === 'function') {
-        window.registerMediaSegment(trackId, packetId, mediaData);
+        // Use your ffmpeg pattern for the segment name
+        const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
+        window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
     }
     
-    // Log fragment details for video (less frequently for audio to reduce log spam)
+    // Log fragment details
     if (isVideo && packetId % 10 === 0) {
         log(`📦 ${trackType} fragment #${packetId} processed, size=${mediaData.byteLength}B`);
     }
@@ -517,7 +544,7 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         this.trackBuffers[trackId].fragments.sort((a, b) => a.sequence - b.sequence);
         this.trackBuffers[trackId].fragments = this.trackBuffers[trackId].fragments.slice(-30);
         
-        // Also clean up the main buffer
+        // Also clean up main buffer
         const oldKeys = Object.keys(this.buffer[trackType])
             .map(Number)
             .sort((a, b) => a - b)
@@ -534,16 +561,10 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         packetId
     );
     
-    // Update HLS manifest if needed (when we get new fragments)
-    if (this.hlsData && (this.trackBuffers[0].fragments.length > 3 || this.trackBuffers[1].fragments.length > 3)) {
-        this._updateHLSManifest();
-    }
-    
-    // Regenerate HLS manifests if needed
-    if (!this.hlsData && this.trackBuffers[0].fragments.length >= 3 && this.trackBuffers[1].fragments.length >= 3) {
-        this._generateHLSManifest();
-    }
-};
+    // Update HLS manifest if needed
+    this._updateHLSManifest();
+}
+
 /**
  * WebTransport HLS.js Player - Part 3: HLS.js Integration
  */
@@ -656,34 +677,35 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
     this.init.audio = null;
 };
 
-/**
- * Set up XHR interception for HLS.js segment requests
- */
-function setupXHRInterception() {
-    if (window.xhrInterceptionEnabled) return;
-    
-    log("🔄 Setting up XMLHttpRequest interception for HLS");
-    window.xhrInterceptionEnabled = true;
-    
-    const originalXHROpen = XMLHttpRequest.prototype.open;
-    const originalXHRSend = XMLHttpRequest.prototype.send;
-    
-    // Create a map to store blob URLs and their corresponding data
-    const blobUrlMap = new Map();
-    
-    // Add method to register manifest blob URLs
-    window.registerManifestBlobUrl = (url, manifestData) => {
-        blobUrlMap.set(url, manifestData);
-        log(`📄 Registered manifest blob URL: ${url}`);
-    };
-    
-    // Add method to register media segments
-    window.registerMediaSegment = (trackId, segmentId, data) => {
-        const key = `segment-${trackId}-${segmentId}`;
-        blobUrlMap.set(key, data);
-    };
-    
-    // Override open method to track request type
+    /**
+     * Set up XHR interception for HLS.js segment requests
+     */
+    function setupXHRInterception() {
+        if (window.xhrInterceptionEnabled) return;
+        
+        log("🔄 Setting up XMLHttpRequest interception for HLS");
+        window.xhrInterceptionEnabled = true;
+        
+        const originalXHROpen = XMLHttpRequest.prototype.open;
+        const originalXHRSend = XMLHttpRequest.prototype.send;
+        
+        // Create a map to store blob URLs and their corresponding data
+        const blobUrlMap = new Map();
+        
+        // Add method to register manifest blob URLs
+        window.registerManifestBlobUrl = (url, manifestData) => {
+            blobUrlMap.set(url, manifestData);
+            log(`📄 Registered manifest blob URL: ${url}`);
+        };
+        
+        // Add method to register media segments
+        window.registerMediaSegment = (trackId, segmentId, data) => {
+            const key = `segment-${trackId}-${segmentId}`;
+            blobUrlMap.set(key, data);
+        };
+        
+        // Override open method to track request type
+    // In setupXHRInterception(), update the XMLHttpRequest.prototype.open override:
     XMLHttpRequest.prototype.open = function(method, url, async) {
         this._url = url;
         this._method = method;
@@ -692,47 +714,23 @@ function setupXHRInterception() {
             log(`🔍 XHR Request: ${method} ${url}`);
         }
         
-        // Track request type
+        // Track request type with improved patterns
         if (typeof url === 'string') {
             // Blob URLs for manifests we've registered
-            if (url.startsWith('blob:') && blobUrlMap.has(url)) {
+            if (url.startsWith('blob:') && window.blobUrlMap && window.blobUrlMap.has(url)) {
                 this._isManifestBlobUrl = true;
                 log(`📄 Recognized manifest blob URL: ${url}`);
             }
             // HLS manifest (.m3u8) requests
-            else if (url.includes('.m3u8')) {
+            else if (url.includes('.m3u8') || url === 'video.m3u8' || url === 'playlist.m3u8') {
                 this._isManifestRequest = true;
                 log(`📄 HLS manifest request detected: ${url}`);
             } 
-            // Init segment requests
-            else if (url.includes('init_') || url.includes('init-')) {
-                this._isInitSegment = true;
-                
-                // Extract track ID from URL pattern
-                const match = url.match(/init[_-](\d+)\.mp4/) || url.match(/init[_-](\w+)\.mp4/);
-                if (match) {
-                    this._trackId = match[1] === 'video' ? 0 : (match[1] === 'audio' ? 1 : parseInt(match[1]));
-                    log(`🔑 Init segment request for track ${this._trackId}`);
-                }
-            } 
-            // Media segment requests
-            else if (url.match(/segment[_-]\d+[_-]\d+\.m4s/) || url.match(/chunk[_-]\d+[_-]\d+\.m4s/)) {
+            // TS segment requests - match your ffmpeg output pattern
+            else if (url.includes('.ts') || url.match(/chunk-\d+\.ts/) || url.match(/chunk-\d{5}\.ts/)) {
                 this._isMediaSegment = true;
                 
-                // Extract track and segment IDs from various URL patterns
-                let match = url.match(/segment[_-](\d+)[_-](\d+)\.m4s/) || 
-                           url.match(/chunk[_-](\d+)[_-](\d+)\.m4s/);
-                
-                if (match) {
-                    this._trackId = parseInt(match[1]);
-                    this._segmentId = parseInt(match[2]);
-                    log(`🎬 Media segment request: track=${this._trackId}, segment=${this._segmentId}`);
-                }
-            }
-            else if (url.includes('.ts') || url.match(/chunk-\d+\.ts/)) {
-                this._isMediaSegment = true;
-                
-                // Extract segment ID from URL pattern matching ffmpeg output
+                // Extract segment ID from pattern matching ffmpeg output
                 const matchSegment = url.match(/chunk-(\d+)\.ts/) || 
                                     url.match(/chunk-(\d{5})\.ts/);
                 
@@ -742,9 +740,10 @@ function setupXHRInterception() {
                     log(`🎬 TS segment request: segment=${this._segmentId}`);
                 }
             }
-            // External requests - don't intercept
-            else if (url.includes('time.akamai.com') || url.includes('/api/')) {
-                this._isExternalRequest = true;
+            // Init segment requests - not needed for TS but kept for completeness
+            else if (url.includes('init') || url.includes('init.mp4')) {
+                this._isInitSegment = true;
+                log(`🔑 Init segment request detected, but not needed for TS streams`);
             }
         }
         
@@ -1286,32 +1285,33 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             return null;
         }
         
-        // Create HLS.js player with improved configuration
+        // Create HLS.js player with configuration specifically for TS segments
         const hls = new Hls({
             debug: false,
             enableWorker: true,
             lowLatencyMode: true,
-            startLevel: 0,
             
-            // More permissive buffer configuration
-            maxBufferLength: 30,
-            maxMaxBufferLength: 60,
-            maxBufferSize: 60 * 1000 * 1000, // 60MB
+            // Increase buffer size for TS segments
+            maxBufferLength: 60,
+            maxMaxBufferLength: 90,
+            maxBufferSize: 120 * 1000 * 1000, // 120MB
+            
+            // More permissive fragment loading settings
+            fragLoadingMaxRetry: 10,
+            manifestLoadingMaxRetry: 10,
+            levelLoadingMaxRetry: 10,
+            fragLoadingRetryDelay: 1000,
             
             // More robust error handling
-            maxBufferHole: 1,
-            fragLoadingMaxRetry: 8,
-            manifestLoadingMaxRetry: 8,
-            levelLoadingMaxRetry: 8,
-            manifestLoadingRetryDelay: 500,
-            fragLoadingRetryDelay: 500,
-            levelLoadingRetryDelay: 500,
+            appendErrorMaxRetry: 5,
+            recoverMediaError: true,
             
-            // Error recovery
-            recoverMediaError: true
+            // Don't stall on missing segments
+            maxBufferHole: 2,
+            maxStarvationDelay: 8000
         });
         
-        // Set up event listeners
+        // Set up event listeners with improved logging
         hls.on(Hls.Events.MEDIA_ATTACHED, () => {
             log("🎬 HLS.js attached to media element");
             hls.loadSource(hlsUrl);
@@ -1321,7 +1321,7 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             log(`📄 HLS manifest parsed: ${data.levels.length} quality levels`);
             window.playerState = 'ready';
             
-            // Enable play button when ready
+            // Enable play button
             const playButton = document.getElementById('playButton');
             if (playButton) {
                 playButton.disabled = false;
@@ -1330,17 +1330,9 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             updateUI();
         });
         
-        // Add improved error handling
+        // Add detailed error handling
         hls.on(Hls.Events.ERROR, (event, data) => {
-            if (data.details === 'manifestParsingError' || data.details === 'levelParsingError') {
-                log(`⚠️ Manifest parsing error: ${data.reason}`);
-                
-                // If this is a manifest error, try to regenerate the manifest
-                if (window.packetHandler) {
-                    window.packetHandler._generateHLSManifest();
-                    log("🔄 Regenerated HLS manifest due to parsing error");
-                }
-            }
+            log(`❌ HLS.js error: ${data.type} - ${data.details}`);
             
             if (data.fatal) {
                 log(`⚠️ Fatal error: ${data.details}`);
@@ -1361,6 +1353,19 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
                         break;
                 }
             }
+        });
+        
+        // Add more verbose event logging
+        hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
+            log(`🔄 Loading fragment: ${data.frag.url}`);
+        });
+        
+        hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+            log(`✅ Fragment loaded: ${data.frag.url}, size: ${data.frag.loaded} bytes`);
+        });
+        
+        hls.on(Hls.Events.FRAG_PARSING_DATA, (event, data) => {
+            log(`⚙️ Parsing fragment data: ${data.type}`);
         });
         
         // Attach to video element
