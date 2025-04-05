@@ -425,12 +425,13 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     if (videoSegments.length === 0) {
         // Add a dummy segment if no segments are available yet
         videoPlaylist += '#EXTINF:4.0,\n';
-        videoPlaylist += 'chunk_0_init.m4s\n';
+        videoPlaylist += 'chunk-00000.ts\n'; // Changed to .ts extension
     } else {
         for (let i = 0; i < videoSegments.length; i++) {
             const segId = videoSegments[i];
             videoPlaylist += '#EXTINF:4.0,\n';
-            videoPlaylist += `chunk_0_${segId}.m4s\n`;
+            // Use the correct segment filename format matching your ffmpeg command
+            videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
         }
         
         if (this.isDisconnected) {
@@ -450,27 +451,7 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
     this.hlsUrl = URL.createObjectURL(masterBlob);
     
-    // Make sure blobUrlMap is defined globally
-    if (!window.blobUrlMap) {
-        window.blobUrlMap = new Map();
-    }
-    
-    // Register all playlists for XHR interception
-    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
-    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
-    
-    // Also use the registerManifestBlobUrl function if available
-    if (typeof window.registerManifestBlobUrl === 'function') {
-        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
-        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
-    }
-    
-    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
-    
-    // Notify that the HLS is ready
-    if (typeof this.onHLSReady === 'function') {
-        this.onHLSReady(this.hlsUrl);
-    }
+    // Rest of your code...
 };
 
 WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
@@ -490,14 +471,13 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         return;
     }
     
-    // Enhanced fragment validation
-    if (mediaData.byteLength < 8) {
-        log(`⚠️ Fragment too small: ${mediaData.byteLength} bytes (minimum 8 required)`);
-        return;
-    }
-    
-    // Log the box type for debugging (first 4 bytes = size, next 4 = type)
-    if (mediaData.byteLength >= 8) {
+    // Enhanced fragment validation for MPEG-TS
+    // Check for TS sync byte (0x47) at the start of the packet
+    if (mediaData.byteLength > 0 && mediaData[0] === 0x47) {
+        log(`🧩 Detected MPEG-TS packet for ${trackType} #${packetId}`);
+        // No need to modify TS packets, hls.js will handle remuxing
+    } else if (mediaData.byteLength >= 8) {
+        // This is likely an fMP4 segment, handle as before
         const boxType = String.fromCharCode(
             mediaData[4], mediaData[5], mediaData[6], mediaData[7]
         );
@@ -507,7 +487,7 @@ WebTransportHLSPacketHandler.prototype._processMediaFragment = function(trackId,
         }
     }
     
-    // Add fragment to buffer with proper indexing
+    // Add fragment to buffer with proper indexing (same for both TS and MP4)
     this.buffer[trackType][packetId] = mediaData;
     
     // Also add to track-specific buffers for better organization
@@ -988,11 +968,14 @@ function setupHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             enableWorker: true,
             lowLatencyMode: true,
             
-            // Buffer configuration (more permissive than default)
+            // Buffer configuration
             maxBufferLength: 30,
             maxMaxBufferLength: 60,
             maxBufferSize: 60 * 1000 * 1000, // 60MB
             maxBufferHole: 0.5,
+            
+            // Important: Let hls.js handle both fMP4 and MPEG-TS segments
+            progressive: false, // Allow non-progressive formats
             
             // Media configuration
             appendErrorMaxRetry: 3,
