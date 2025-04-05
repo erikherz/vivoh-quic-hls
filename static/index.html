@@ -392,7 +392,7 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     // Create a video media playlist
     let videoPlaylist = '#EXTM3U\n';
     videoPlaylist += '#EXT-X-VERSION:3\n';
-    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match your ffmpeg -hls_time 1
+    videoPlaylist += '#EXT-X-TARGETDURATION:1\n'; // Match ffmpeg -hls_time 1
     videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
     
     // Add segment entries for video
@@ -410,7 +410,6 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             // Use segmentDuration if available, otherwise default to 1.0
             const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
             videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
-            // Match the format from your ffmpeg command
             videoPlaylist += `chunk-${segId.toString().padStart(5, '0')}.ts\n`;
         }
         
@@ -529,11 +528,11 @@ WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
     });
     
     // Register the media segment for XHR interception
-    if (typeof window.registerMediaSegment === 'function') {
-        // Use your ffmpeg pattern for the segment name
-        const segmentName = `chunk-${packetId.toString().padStart(5, '0')}.ts`;
-        window.registerMediaSegment(trackId, packetId, mediaData, segmentName);
-    }
+        window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
+        // Store with the exact name that will be used in requests
+        blobUrlMap.set(segmentName, data);
+        log(`🔗 Registered segment: ${segmentName}`);
+    };
     
     // Log fragment details
     if (isVideo && packetId % 10 === 0) {
@@ -851,43 +850,57 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
         }
         
         // Media Segment Request
-        if (this._isMediaSegment && typeof this._trackId !== 'undefined' && typeof this._segmentId !== 'undefined') {
-            const trackId = this._trackId;
-            const segmentId = this._segmentId;
-            const trackType = trackId === 0 ? "video" : "audio";
+        if (this._isMediaSegment) {
+            log(`🔍 Looking for media segment: ${this._url}`);
             
-            // Try to get segment from packetHandler
+            // Extract segment name from URL
+            const urlParts = this._url.split('/');
+            const segmentName = urlParts[urlParts.length - 1]; // Get the last part of the URL
+            
             let segmentData = null;
+            let trackId = 0; // Default to video track
             
-            // First check if exact segment exists in buffer
-            if (window.packetHandler && window.packetHandler.buffer[trackType][segmentId]) {
-                segmentData = window.packetHandler.buffer[trackType][segmentId];
-                log(`🎬 Found exact segment: track=${trackId}, segment=${segmentId}`);
+            // First check if we have an exact match in blobUrlMap
+            if (window.blobUrlMap && window.blobUrlMap.has(segmentName)) {
+                segmentData = window.blobUrlMap.get(segmentName);
+                log(`🎬 Found exact segment in blobUrlMap: ${segmentName}`);
             } 
-            // If not, try to find a segment close to the requested one
-            else if (window.packetHandler) {
-                const buffer = window.packetHandler.buffer[trackType];
-                const keys = Object.keys(buffer).map(Number).sort((a, b) => a - b);
+            // Otherwise, try to get segment from the segment ID
+            else if (this._trackId !== undefined && this._segmentId !== undefined) {
+                trackId = this._trackId;
+                const segmentId = this._segmentId;
+                const trackType = trackId === 0 ? "video" : "audio";
                 
-                if (keys.length > 0) {
-                    // Try to find closest segment - better to use newer segments
-                    const closerKeys = keys.filter(k => Math.abs(k - segmentId) < 10);
+                // First check if exact segment exists in buffer
+                if (window.packetHandler && window.packetHandler.buffer[trackType][segmentId]) {
+                    segmentData = window.packetHandler.buffer[trackType][segmentId];
+                    log(`🎬 Found exact segment in buffer: track=${trackId}, segment=${segmentId}`);
+                } 
+                // If not, try to find a segment close to the requested one
+                else if (window.packetHandler && window.packetHandler.buffer[trackType]) {
+                    const buffer = window.packetHandler.buffer[trackType];
+                    const keys = Object.keys(buffer).map(Number).sort((a, b) => a - b);
                     
-                    if (closerKeys.length > 0) {
-                        const closestId = closerKeys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId))[0];
-                        log(`🔄 Using closest segment: ${trackType} #${closestId} instead of #${segmentId}`);
-                        segmentData = buffer[closestId];
-                    } else {
-                        // Default to most recent segment
-                        const latestKey = keys[keys.length - 1];
-                        log(`🔄 Using latest segment: ${trackType} #${latestKey} instead of #${segmentId}`);
-                        segmentData = buffer[latestKey];
+                    if (keys.length > 0) {
+                        // Try to find closest segment
+                        const closerKeys = keys.filter(k => Math.abs(k - segmentId) < 10);
+                        
+                        if (closerKeys.length > 0) {
+                            const closestId = closerKeys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId))[0];
+                            log(`🔄 Using closest segment: ${trackType} #${closestId} instead of #${segmentId}`);
+                            segmentData = buffer[closestId];
+                        } else {
+                            // Default to most recent segment
+                            const latestKey = keys[keys.length - 1];
+                            log(`🔄 Using latest segment: ${trackType} #${latestKey} instead of #${segmentId}`);
+                            segmentData = buffer[latestKey];
+                        }
                     }
                 }
             }
             
             if (segmentData) {
-                log(`🎬 Serving segment: track=${trackId}, segment=${segmentId} (${segmentData.byteLength} bytes)`);
+                log(`🎬 Serving segment: ${segmentName} (${segmentData.byteLength} bytes)`);
                 
                 setTimeout(() => {
                     // IMPORTANT: Ensure using correct responseType
@@ -915,12 +928,12 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
                     this.dispatchEvent(new Event('load'));
                     this.dispatchEvent(new Event('loadend'));
                     
-                    log(`✅ Media segment served: track=${trackId}, segment=${segmentId}`);
+                    log(`✅ Media segment served: ${segmentName}`);
                 }, 10);
                 
                 return;
             } else {
-                log(`⚠️ No media segment available for track=${trackId}, segment=${segmentId}`);
+                log(`⚠️ No media segment available for: ${segmentName}`);
                 // Respond with 404 to allow hls.js to retry
                 setTimeout(() => {
                     Object.defineProperty(this, 'status', { get: () => 404 });
