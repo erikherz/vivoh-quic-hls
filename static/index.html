@@ -1383,10 +1383,7 @@ function setupPacketHandlerCallbacks() {
  * @param {string} url - WebTransport server URL
  * @returns {WebTransportHLSPacketHandler} - The packet handler
  */
-// Fix: Call setupXHRInterception and the debugging enhancement
-// in the setupWebTransport function
-
-async function setupWebTransport(url) {
+ async function setupWebTransport(url) {
     try {
         window.disconnectionRequested = false;
         
