@@ -846,6 +846,8 @@ function enhanceXHRDebugging() {
                 
                 // Store the segment name for later use
                 this._segmentName = segmentName;
+                log(`🧲 Intercepted XHR open for: ${url} → segment name: ${segmentName}`);
+
                 
                 // Try to extract segment ID from pattern
                 const matchSegment = segmentName.match(/chunk-(\d+)\.ts/);
@@ -963,7 +965,8 @@ function enhanceXHRDebugging() {
         
         if (this._isMediaSegment) {
             // First look for segments by name if available
-            log(`🔍 Checking for segment: ${this._segmentName}`);
+            log(`📦 Checking for segment: ${this._segmentName}`);
+            log(`📦 isMediaSegment=${this._isMediaSegment}`);
 
             if (this._segmentName && window.blobUrlMap && window.blobUrlMap.has(this._segmentName)) {
                 const segmentData = window.blobUrlMap.get(this._segmentName);
@@ -2224,7 +2227,7 @@ document.addEventListener('DOMContentLoaded', function() {
         log(`🔌 Disconnecting...`);
         
         handleConnectionClosed();
-        
+
         if (window.hls) {
             window.hls.destroy();
             window.hls = null;
