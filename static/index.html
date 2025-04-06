@@ -457,6 +457,7 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             const blob = new Blob([this.buffer.video[segId]], { type: 'video/mp2t' });
             const blobUrl = URL.createObjectURL(blob);
             window.segmentBlobUrlMap.set(segmentName, blobUrl);
+            blobUrlMap.set(blobUrl, blob);
 
             // Optional: registerMediaSegment if you still use it elsewhere
             window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
@@ -744,6 +745,7 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
                 for (const [name, blobUrl] of window.segmentBlobUrlMap.entries()) {
                     try {
                         URL.revokeObjectURL(blobUrl);
+                        blobUrlMap.set(blobUrl, blob);
                         log(`🧹 Revoked segment blob URL: ${name}`);
                     } catch (e) {
                         log(`⚠️ Error revoking segment URL "${name}": ${e.message}`);
