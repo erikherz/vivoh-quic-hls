@@ -1068,7 +1068,7 @@ function generateVideoPlaylist(packetHandler) {
     videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
     videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
 
-    const MAX_SEGMENT_ID = 100; // or however far you want to keep
+    const MAX_SEGMENT_ID = 1000; 
 
     const videoSegments = Object.keys(packetHandler.buffer.video)
         .map(Number)
