@@ -452,8 +452,6 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             const segDuration = this.trackBuffers[0].fragments.find(f => f.sequence === segId)?.segmentDuration || 1.0;
             videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
             
-            // FIX: Always use the original segment ID in the manifest
-            // This ensures consistency between manifest entries and XHR requests
             const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
             videoPlaylist += `${segmentName}\n`;
             
@@ -772,6 +770,7 @@ function enhanceXHRDebugging() {
     // Override send method to add additional logging
     XMLHttpRequest.prototype.send = function(body) {
         // Log segment requests for debugging purposes
+        log(`📦 START Checking blobUrlMap for segment: ${this._segmentName}`);
         if (this._isMediaSegment) {
             log(`🔍 XHR REQUEST: Segment=${this._segmentName || "unknown"}, URL=${this._url}`);
             
@@ -976,6 +975,8 @@ function enhanceXHRDebugging() {
                 if (window.packetHandler.buffer[trackType][this._segmentId]) {
                     const segmentData = window.packetHandler.buffer[trackType][this._segmentId];
                     serveSegmentData(this, segmentData, `segment-${this._trackId}-${this._segmentId}`);
+                    log(`📦 Segment "${this._segmentName}" found in blob map, serving now`);
+
                     return;
                 }
             }
@@ -1842,6 +1843,8 @@ function enhanceXHRDebugging() {
             const originalOnError = this.onerror;
             const url = this._url;
             const segmentName = this._segmentName;
+            log(`🔍 XHR segment requested: ${segmentName}`);
+
             const startTime = this._requestStartTime;
             
             this.onload = function(e) {
@@ -1866,8 +1869,9 @@ function enhanceXHRDebugging() {
                 if (originalOnError) originalOnError.call(this, e);
             };
         }
-        
+        log(`📦 Attempting to serve: ${this._segmentName}`);
         originalXHRSend.call(this, body);
+        
     };
     
     log(`✅ Enhanced XHR debugging completed`);
