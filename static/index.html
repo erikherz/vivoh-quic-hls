@@ -182,6 +182,7 @@ let xhrInterceptionEnabled = false;
 let streamCounter = 0;
 let bufferLoggingIntervals = [];
 window.blobUrlMap = new Map();
+window.segmentBlobUrlMap = new Map();
 let masterPlaylistUrl = null;
 let videoPlaylistUrl = null;
 let fragmentCounter = 0;
@@ -453,10 +454,15 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             videoPlaylist += `#EXTINF:${segDuration.toFixed(3)},\n`;
             
             const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
-            videoPlaylist += `${segmentName}\n`;
-            
-            // Register segment with consistent naming
+            const blob = new Blob([this.buffer.video[segId]], { type: 'video/mp2t' });
+            const blobUrl = URL.createObjectURL(blob);
+            window.segmentBlobUrlMap.set(segmentName, blobUrl);
+
+            // Optional: registerMediaSegment if you still use it elsewhere
             window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
+
+            videoPlaylist += `${blobUrl}\n`;
+
         }
         
         if (this.isDisconnected) {
@@ -734,6 +740,17 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
             URL.revokeObjectURL(masterPlaylistUrl);
             log(`🧹 Revoked master playlist URL: ${masterPlaylistUrl}`);
             masterPlaylistUrl = null;
+            if (window.segmentBlobUrlMap) {
+                for (const [name, blobUrl] of window.segmentBlobUrlMap.entries()) {
+                    try {
+                        URL.revokeObjectURL(blobUrl);
+                        log(`🧹 Revoked segment blob URL: ${name}`);
+                    } catch (e) {
+                        log(`⚠️ Error revoking segment URL "${name}": ${e.message}`);
+                    }
+                }
+                window.segmentBlobUrlMap.clear();
+            }
         } catch (e) {
             log(`⚠️ Error revoking master playlist URL: ${e.message}`);
         }
