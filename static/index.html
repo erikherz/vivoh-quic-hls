@@ -963,6 +963,8 @@ function enhanceXHRDebugging() {
         
         if (this._isMediaSegment) {
             // First look for segments by name if available
+            log(`🔍 Checking for segment: ${this._segmentName}`);
+
             if (this._segmentName && window.blobUrlMap && window.blobUrlMap.has(this._segmentName)) {
                 const segmentData = window.blobUrlMap.get(this._segmentName);
                 serveSegmentData(this, segmentData, this._segmentName);
@@ -1813,7 +1815,8 @@ function enhanceXHRDebugging() {
             const urlParts = url.split('/');
             const segmentName = urlParts[urlParts.length - 1];
             this._segmentName = segmentName;
-            
+            log(`🎯 Intercepted XHR for segment: ${segmentName}`);
+
             // Check if the segment is in our map
             if (window.blobUrlMap && window.blobUrlMap.has(segmentName)) {
                 log(`✅ Segment found in blob map: ${segmentName}`);
@@ -2221,6 +2224,21 @@ document.addEventListener('DOMContentLoaded', function() {
         log(`🔌 Disconnecting...`);
         
         handleConnectionClosed();
+        
+        if (window.hls) {
+            window.hls.destroy();
+            window.hls = null;
+        }
+
+        const video = document.getElementById('videoElement');
+        video.pause();
+        video.src = '';
+        video.load();
+
+        log("🛑 Playback and stream processing stopped.");
+
+        window.blobUrlMap.clear();
+
     });
     
     // Initialize UI
