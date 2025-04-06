@@ -1068,8 +1068,11 @@ function generateVideoPlaylist(packetHandler) {
     videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
     videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
 
+    const MAX_SEGMENT_ID = 100; // or however far you want to keep
+
     const videoSegments = Object.keys(packetHandler.buffer.video)
         .map(Number)
+        .filter(id => Number.isFinite(id) && id >= 0 && id <= MAX_SEGMENT_ID)
         .sort((a, b) => a - b);
 
     let includedCount = 0;
@@ -1877,15 +1880,26 @@ function enhanceXHRDebugging() {
             } else {
                 log(`⚠️ Segment NOT found in blob map: ${segmentName}`);
                 
-                // Debug available segments
                 if (window.blobUrlMap) {
                     const segmentKeys = Array.from(window.blobUrlMap.keys())
                         .filter(k => k.includes('.ts'))
                         .slice(0, 5); // Show first 5 to avoid log spam
-                    
+
                     log(`🔍 Available segments (first 5): ${segmentKeys.join(', ')}${
                         window.blobUrlMap.size > 5 ? ` (and ${window.blobUrlMap.size - 5} more)` : ''
                     }`);
+
+                    // 🧹 Remove segments with invalid or suspiciously large IDs
+                    const MAX_SAFE_ID = 100_000; // adjust if needed
+                    for (const key of window.blobUrlMap.keys()) {
+                        const match = key.match(/chunk-(\d+)\.ts/);
+                        const id = match ? parseInt(match[1], 10) : null;
+
+                        if (!Number.isFinite(id) || id < 0 || id > MAX_SAFE_ID) {
+                            console.log(`🧹 Removing invalid segment key: ${key}`);
+                            window.blobUrlMap.delete(key);
+                        }
+                    }
                 }
             }
         }
