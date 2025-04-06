@@ -1207,7 +1207,7 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
         
         // Create HLS.js player with configuration specifically for TS segments
         const hls = new Hls({
-            debug: false,
+            debug: true, // Turn on HLS.js built-in debugging
             enableWorker: true,
             lowLatencyMode: true,
             
@@ -1224,13 +1224,17 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             
             // More robust error handling
             appendErrorMaxRetry: 5,
+            
+            // Explicitly enable various recovery modes
             recoverMediaError: true,
+            recoverNetworkError: true,
             
             // Don't stall on missing segments
             maxBufferHole: 2,
             maxStarvationDelay: 8000
         });
 
+        // Add extra video element event listeners for better debugging
         if (videoElement) {
             videoElement.addEventListener('error', (e) => {
                 log(`❌ Video element error: ${videoElement.error?.code}, ${videoElement.error?.message}`);
@@ -1242,114 +1246,48 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
             
             videoElement.addEventListener('playing', () => {
                 log(`▶️ Video started playing`);
+                window.playerState = 'playing';
+                updateUI();
             });
             
             videoElement.addEventListener('stalled', () => {
                 log(`⏸️ Video playback stalled`);
+                window.playerState = 'buffering';
+                updateUI();
+            });
+            
+            videoElement.addEventListener('waiting', () => {
+                log(`⏸️ Video waiting for data`);
+                window.playerState = 'buffering';
+                updateUI();
             });
         }
         
-        // Set up event listeners with improved logging
-        hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-            log("🎬 HLS.js attached to media element");
-            hls.loadSource(hlsUrl);
-        });
-        
-        hls.on(Hls.Events.MANIFEST_LOADING, (event, data) => {
-            log(`📄 Loading HLS manifest: ${data.url}`);
-        });
-
-        hls.on(Hls.Events.MANIFEST_LOADED, (event, data) => {
-            log(`📄 HLS manifest loaded: ${data.url}`);
-            if (data.levels && data.levels.length > 0) {
-                log(`📄 HLS manifest contains ${data.levels.length} levels`);
-                data.levels.forEach((level, index) => {
-                    log(`📄 Level ${index}: ${level.url}`);
-                });
-            }
-        });
-
-        hls.on(Hls.Events.ERROR, (event, data) => {
-            log(`❌ HLS.js error: Type=${data.type}, Details=${data.details}, Fatal=${data.fatal}`);
-            console.error("Error data:", data);
-            
-            if (data.response) {
-                log(`❌ Response error: Status=${data.response.code}, URL=${data.response.url}`);
-            }
-        });
-
-        hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-            log(`✅ Fragment loaded: ${data.frag.url}, size=${data.frag.loaded} bytes`);
-        });
-
-        hls.on(Hls.Events.FRAG_LOADING_ERROR, (event, data) => {
-            log(`❌ Fragment loading error: ${data.frag.url}, Details=${data.details}`);
-        });
-
-        hls.on(Hls.Events.FRAG_PARSING_ERROR, (event, data) => {
-            log(`❌ Fragment parsing error: ${data.frag.url}, Details=${data.details}`);
-        });
-
-        hls.on(Hls.Events.FRAG_DECRYPTION_ERROR, (event, data) => {
-            log(`❌ Fragment decryption error: ${data.frag.url}, Details=${data.details}`);
-        });
-
-        hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-            log(`📄 HLS manifest parsed: ${data.levels.length} quality levels`);
-            window.playerState = 'ready';
-            
-            // Enable play button
-            const playButton = document.getElementById('playButton');
-            if (playButton) {
-                playButton.disabled = false;
-            }
-            
-            updateUI();
-        });
-        
-        // Add detailed error handling
-        hls.on(Hls.Events.ERROR, (event, data) => {
-            log(`❌ HLS.js error: ${data.type} - ${data.details}`);
-            
-            if (data.fatal) {
-                log(`⚠️ Fatal error: ${data.details}`);
-                
-                switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR:
-                        log("🔄 Attempting to recover from network error");
-                        hls.startLoad();
-                        break;
-                    case Hls.ErrorTypes.MEDIA_ERROR:
-                        log("🔄 Attempting to recover from media error");
-                        hls.recoverMediaError();
-                        break;
-                    default:
-                        log("❌ Cannot recover from error");
-                        window.playerState = 'error';
-                        updateUI();
-                        break;
-                }
-            }
-        });
-        
-        // Add more verbose event logging
-        hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
-            log(`🔄 Loading fragment: ${data.frag.url}`);
-        });
-        
-        hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-            log(`✅ Fragment loaded: ${data.frag.url}, size: ${data.frag.loaded} bytes`);
-        });
-        
-        hls.on(Hls.Events.FRAG_PARSING_DATA, (event, data) => {
-            log(`⚙️ Parsing fragment data: ${data.type}`);
-        });
+        // Set up enhanced event monitoring
+        enhanceHLSEventMonitoring(hls);
         
         // Attach to video element
         hls.attachMedia(videoElement);
         
         // Store the player globally
         window.player = hls;
+        
+        // In Hls.Events.MEDIA_ATTACHED, load the source
+        hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+            log(`🎬 HLS.js attached to media element`);
+            log(`🔗 Loading source: ${hlsUrl}`);
+            hls.loadSource(hlsUrl);
+        });
+        
+        // Automatic playback after manifest is parsed (optional)
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            log(`📄 Manifest parsed, attempting to play...`);
+            // Uncomment to enable auto-play:
+            // videoElement.play().catch(err => {
+            //     log(`❌ Auto-play failed: ${err.message}`);
+            // });
+        });
+        
         log(`✅ HLS.js player initialized with URL: ${hlsUrl}`);
         
         return hls;
@@ -1358,6 +1296,97 @@ function initializeHLSPlayer(hlsUrl = '/vivoh.m3u8') {
         return null;
     }
 }
+
+function validateAndDebugManifest(manifestContent) {
+    if (!manifestContent) {
+        log(`❌ Empty manifest content!`);
+        return false;
+    }
+    
+    try {
+        // Basic validation
+        if (!manifestContent.includes('#EXTM3U')) {
+            log(`❌ Invalid manifest - missing #EXTM3U header`);
+            return false;
+        }
+        
+        // Count segments
+        const segmentCount = (manifestContent.match(/#EXTINF/g) || []).length;
+        log(`📋 Manifest contains ${segmentCount} segments`);
+        
+        // Check for EXT-X-VERSION
+        if (!manifestContent.includes('#EXT-X-VERSION')) {
+            log(`⚠️ Manifest missing EXT-X-VERSION tag`);
+        }
+        
+        // Check for media sequence
+        if (!manifestContent.includes('#EXT-X-MEDIA-SEQUENCE')) {
+            log(`⚠️ Manifest missing EXT-X-MEDIA-SEQUENCE tag`);
+        }
+        
+        // Check if master playlist
+        const isMasterPlaylist = manifestContent.includes('#EXT-X-STREAM-INF');
+        
+        if (isMasterPlaylist) {
+            log(`📋 Manifest is a master playlist`);
+            
+            // Extract variant URLs
+            const streamInfoPattern = /#EXT-X-STREAM-INF:([^\n]+)\n([^\n]+)/g;
+            let match;
+            let variantCount = 0;
+            
+            while ((match = streamInfoPattern.exec(manifestContent)) !== null) {
+                variantCount++;
+                const attributes = match[1];
+                const variantUrl = match[2].trim();
+                
+                log(`📋 Found variant #${variantCount}: ${variantUrl}`);
+                
+                // For blob URLs, see if they're in the blobUrlMap
+                if (variantUrl.startsWith('blob:') && window.blobUrlMap) {
+                    if (window.blobUrlMap.has(variantUrl)) {
+                        log(`✅ Variant URL exists in blob map`);
+                    } else {
+                        log(`❌ Variant URL not found in blob map: ${variantUrl}`);
+                    }
+                }
+            }
+        } else {
+            // Media playlist
+            log(`📋 Manifest is a media playlist with ${segmentCount} segments`);
+            
+            // Extract segment URLs and durations
+            const segmentPattern = /#EXTINF:([^,]+)(?:,([^\n]+))?\n([^\n]+)/g;
+            let match;
+            let totalDuration = 0;
+            
+            while ((match = segmentPattern.exec(manifestContent)) !== null) {
+                const duration = parseFloat(match[1]);
+                const title = match[2] || '';
+                const segmentUrl = match[3].trim();
+                
+                totalDuration += duration;
+                
+                if (segmentUrl.includes('.ts')) {
+                    log(`📋 Segment: ${segmentUrl}, duration=${duration.toFixed(3)}s${title ? `, title=${title}` : ''}`);
+                    
+                    // Check if this segment is already registered
+                    if (window.blobUrlMap && !window.blobUrlMap.has(segmentUrl)) {
+                        log(`⚠️ Segment not registered in blob map: ${segmentUrl}`);
+                    }
+                }
+            }
+            
+            log(`📋 Total playlist duration: ${totalDuration.toFixed(3)}s`);
+        }
+        
+        return true;
+    } catch (error) {
+        log(`❌ Error validating manifest: ${error.message}`);
+        return false;
+    }
+}
+
 
 // Function to set up packet handler callbacks
 function setupPacketHandlerCallbacks() {
@@ -1377,13 +1406,7 @@ function setupPacketHandlerCallbacks() {
     log("✅ Packet handler callbacks configured");
 }
 
-/**
- * Setup WebTransport connection and handlers for HLS
- * 
- * @param {string} url - WebTransport server URL
- * @returns {WebTransportHLSPacketHandler} - The packet handler
- */
- async function setupWebTransport(url) {
+async function setupWebTransport(url) {
     try {
         window.disconnectionRequested = false;
         
@@ -1402,14 +1425,33 @@ function setupPacketHandlerCallbacks() {
         // Initialize packet handler for HLS
         window.packetHandler = new WebTransportHLSPacketHandler();
         
+        // Add a callback to validate the manifest when generated
+        const originalGenerateHLS = window.packetHandler._generateHLSManifest;
+        window.packetHandler._generateHLSManifest = function() {
+            // Call the original function
+            originalGenerateHLS.apply(this, arguments);
+            
+            // Now validate the generated manifest
+            if (this.hlsData) {
+                log(`🔍 Validating master manifest:`);
+                validateAndDebugManifest(this.hlsData);
+                
+                // Also validate video playlist
+                const videoPlaylistContent = window.blobUrlMap.get(window.videoPlaylistUrl);
+                if (videoPlaylistContent) {
+                    log(`🔍 Validating video playlist:`);
+                    validateAndDebugManifest(videoPlaylistContent);
+                }
+            }
+        };
+        
         // Set up improved callbacks
         setupPacketHandlerCallbacks();
         
-        // IMPORTANT: Set up XHR interception before connecting
-        // This ensures the interception is ready when HLS.js starts requesting segments
+        // Set up XHR interception before connecting
         setupXHRInterception();
         
-        // Add enhanced debugging (optional but recommended)
+        // Add enhanced debugging
         enhanceXHRDebugging();
         
         // Connect to WebTransport 
@@ -1453,6 +1495,385 @@ function setupPacketHandlerCallbacks() {
         updateUI();
         throw error;
     }
+}
+
+function setupImprovedPlayButton() {
+    const playButton = document.getElementById('playButton');
+    if (!playButton) return;
+    
+    playButton.addEventListener('click', function() {
+        log(`🎮 Play button clicked`);
+        
+        if (window.player) {
+            const videoElement = document.getElementById('videoElement');
+            
+            if (!videoElement) {
+                log(`❌ Video element not found!`);
+                return;
+            }
+            
+            log(`▶️ Attempting to play video...`);
+            
+            // Extra error handling
+            const playPromise = videoElement.play();
+            
+            if (playPromise !== undefined) {
+                playPromise
+                    .then(() => {
+                        log(`✅ Video playback started successfully`);
+                        window.playerState = 'playing';
+                        updateUI();
+                    })
+                    .catch(err => {
+                        log(`❌ Error playing: ${err.name} - ${err.message}`);
+                        
+                        // Handle autoplay restrictions
+                        if (err.name === 'NotAllowedError') {
+                            log(`⚠️ Autoplay prevented by browser policy, user gesture required`);
+                            alert('Your browser requires interaction before playback. Please click play again.');
+                        }
+                    });
+            } else {
+                log(`⚠️ Play promise undefined, browser may not support promises for media playback`);
+            }
+        } else {
+            log(`⚠️ Player not initialized yet, initializing now...`);
+            
+            if (window.packetHandler && window.packetHandler.hlsUrl) {
+                const player = initializeHLSPlayer(window.packetHandler.hlsUrl);
+                
+                if (player) {
+                    log(`✅ Player initialized on-demand, waiting for manifest to load before playing`);
+                    
+                    // Play after manifest is parsed
+                    player.on(Hls.Events.MANIFEST_PARSED, () => {
+                        log(`📄 Manifest parsed, attempting to play...`);
+                        
+                        const videoElement = document.getElementById('videoElement');
+                        if (videoElement) {
+                            videoElement.play().catch(err => {
+                                log(`❌ Error playing after manifest parsed: ${err.message}`);
+                            });
+                        }
+                    });
+                }
+            } else {
+                log(`❌ No HLS URL available for playback`);
+            }
+        }
+    });
+    
+    log(`✅ Improved play button handler set up`);
+}
+
+function enhanceXHRDebugging() {
+    // Only run this if XHR interception is already enabled
+    if (!window.xhrInterceptionEnabled) return;
+    
+    log("🔍 Enhancing XMLHttpRequest debugging for HLS.js");
+    
+    // Store the original open and send methods
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    
+    // Add request/response timing tracking
+    window.requestTimings = {};
+    
+    // Override open method with improved URL pattern detection
+    XMLHttpRequest.prototype.open = function(method, url, async) {
+        this._url = url;
+        this._method = method;
+        this._requestStartTime = Date.now();
+        
+        // Log all HLS-related requests for debugging
+        if (typeof url === 'string' && (url.includes('.m3u8') || url.includes('.ts') || url.startsWith('blob:'))) {
+            log(`🔍 XHR ${method} Request: ${url}`);
+        }
+        
+        // Add more detailed tracking for segment requests
+        if (typeof url === 'string' && url.includes('.ts')) {
+            this._isMediaSegment = true;
+            
+            // Extract the segment name from the URL
+            const urlParts = url.split('/');
+            const segmentName = urlParts[urlParts.length - 1];
+            this._segmentName = segmentName;
+            
+            // Check if the segment is in our map
+            if (window.blobUrlMap && window.blobUrlMap.has(segmentName)) {
+                log(`✅ Segment found in blob map: ${segmentName}`);
+            } else {
+                log(`⚠️ Segment NOT found in blob map: ${segmentName}`);
+                
+                // Debug available segments
+                if (window.blobUrlMap) {
+                    const segmentKeys = Array.from(window.blobUrlMap.keys())
+                        .filter(k => k.includes('.ts'))
+                        .slice(0, 5); // Show first 5 to avoid log spam
+                    
+                    log(`🔍 Available segments (first 5): ${segmentKeys.join(', ')}${
+                        window.blobUrlMap.size > 5 ? ` (and ${window.blobUrlMap.size - 5} more)` : ''
+                    }`);
+                }
+            }
+        }
+        
+        originalXHROpen.call(this, method, url, async !== false);
+    };
+    
+    // Override send method to track responses
+    XMLHttpRequest.prototype.send = function(body) {
+        if (this._isMediaSegment || (typeof this._url === 'string' && this._url.includes('.m3u8'))) {
+            const originalOnLoad = this.onload;
+            const originalOnError = this.onerror;
+            const url = this._url;
+            const segmentName = this._segmentName;
+            const startTime = this._requestStartTime;
+            
+            this.onload = function(e) {
+                const endTime = Date.now();
+                const duration = endTime - startTime;
+                
+                if (this.status === 200) {
+                    if (typeof url === 'string' && url.includes('.ts')) {
+                        log(`✅ Segment loaded: ${segmentName || url} (${duration}ms, size: ${this.response?.byteLength || 0} bytes)`);
+                    } else if (typeof url === 'string' && url.includes('.m3u8')) {
+                        log(`✅ Manifest loaded: ${url} (${duration}ms)`);
+                    }
+                } else {
+                    log(`❌ Failed to load: ${url} (${this.status})`);
+                }
+                
+                if (originalOnLoad) originalOnLoad.call(this, e);
+            };
+            
+            this.onerror = function(e) {
+                log(`❌ Error loading: ${url}`);
+                if (originalOnError) originalOnError.call(this, e);
+            };
+        }
+        
+        originalXHRSend.call(this, body);
+    };
+    
+    log(`✅ Enhanced XHR debugging completed`);
+    return true;
+}
+
+function enhanceHLSEventMonitoring(hls) {
+    if (!hls || !window.Hls) {
+        log(`❌ Cannot enhance HLS monitoring - player not initialized`);
+        return false;
+    }
+    
+    log(`🔍 Setting up detailed HLS.js event monitoring`);
+    
+    // Track buffer state
+    window.hlsBufferState = {
+        audio: {
+            buffered: [],
+            appended: 0
+        },
+        video: {
+            buffered: [],
+            appended: 0
+        },
+        lastUpdate: Date.now()
+    };
+    
+    // Monitor fragment loading
+    hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
+        log(`🔄 Loading fragment: level=${data.frag.level}, sn=${data.frag.sn}, type=${data.frag.type}, url=${data.frag.url}`);
+    });
+    
+    // Monitor successful loading
+    hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+        log(`✅ Fragment loaded: level=${data.frag.level}, sn=${data.frag.sn}, type=${data.frag.type}, size=${data.frag.loaded} bytes`);
+    });
+    
+    // Monitor fragment parse success
+    hls.on(Hls.Events.FRAG_PARSING_DATA, (event, data) => {
+        const type = data.type;
+        window.hlsBufferState[type].appended++;
+        log(`⚙️ Parsed fragment data: type=${type}, pts=${data.startPTS.toFixed(2)}-${data.endPTS.toFixed(2)}, duration=${(data.endPTS - data.startPTS).toFixed(2)}s`);
+        
+        // Update UI to show that fragments are being processed
+        const bufferStatus = document.getElementById('bufferStatus');
+        if (bufferStatus) {
+            const videoCount = window.hlsBufferState.video.appended;
+            const audioCount = window.hlsBufferState.audio.appended;
+            bufferStatus.textContent = `${videoCount + audioCount} fragments`;
+        }
+    });
+    
+    // Monitor media attaching
+    hls.on(Hls.Events.MEDIA_ATTACHED, (event, data) => {
+        log(`📱 Media element attached to HLS.js`);
+        
+        // Update player status
+        window.playerState = 'attached';
+        updateUI();
+    });
+    
+    // Monitor media detaching
+    hls.on(Hls.Events.MEDIA_DETACHED, (event, data) => {
+        log(`📱 Media element detached from HLS.js`);
+        
+        // Update player status
+        window.playerState = 'detached';
+        updateUI();
+    });
+    
+    // Monitor buffer appending
+    hls.on(Hls.Events.BUFFER_APPENDING, (event, data) => {
+        log(`📋 Appending to ${data.type} buffer: ${data.data.byteLength} bytes`);
+    });
+    
+    // Monitor buffer appended
+    hls.on(Hls.Events.BUFFER_APPENDED, (event, data) => {
+        log(`📋 Appended to ${data.type} buffer`);
+    });
+    
+    // Enhanced error monitoring
+    hls.on(Hls.Events.ERROR, (event, data) => {
+        const errorTypes = {
+            [Hls.ErrorTypes.NETWORK_ERROR]: 'Network',
+            [Hls.ErrorTypes.MEDIA_ERROR]: 'Media',
+            [Hls.ErrorTypes.MUX_ERROR]: 'Multiplexing',
+            [Hls.ErrorTypes.OTHER_ERROR]: 'Other'
+        };
+        
+        const errorType = errorTypes[data.type] || data.type;
+        const errorDetails = data.details || 'unknown';
+        const isFatal = !!data.fatal;
+        
+        log(`❌ ${isFatal ? 'FATAL ' : ''}${errorType} ERROR: ${errorDetails}`);
+        
+        if (data.response) {
+            log(`❌ Response: status=${data.response.code}, url=${data.response.url}`);
+        }
+        
+        // Add more details based on error type
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            log(`❌ Network error context: ${JSON.stringify({
+                url: data.context?.url,
+                status: data.context?.status,
+                networkDetails: data.networkDetails?.status
+            })}`);
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            log(`❌ Media error context: ${data.context || 'No context'}`);
+        }
+        
+        if (isFatal) {
+            log(`⚠️ Attempting to recover from fatal error...`);
+            
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                hls.startLoad();
+                log(`🔄 Restarting network loading...`);
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+                log(`🔄 Attempting media error recovery...`);
+            }
+        }
+    });
+    
+    // Monitor level loading
+    hls.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+        log(`📝 Level ${data.level} loaded: ${data.details.fragments.length} fragments, duration=${data.details.totalduration.toFixed(2)}s`);
+    });
+    
+    // Monitor manifest loading
+    hls.on(Hls.Events.MANIFEST_LOADED, (event, data) => {
+        log(`📝 Manifest loaded: ${data.levels.length} quality levels`);
+    });
+    
+    // Monitor manifest parsed
+    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        log(`📝 Manifest parsed: ${data.levels.length} quality levels`);
+        
+        // Update player status
+        window.playerState = 'ready';
+        updateUI();
+        
+        // Enable play button
+        const playButton = document.getElementById('playButton');
+        if (playButton) {
+            playButton.disabled = false;
+        }
+    });
+    
+    // Media events
+    const video = hls.media;
+    if (video) {
+        ['loadstart', 'play', 'playing', 'pause', 'seeking', 'seeked', 'waiting', 'stalled', 'ended', 'error'].forEach(eventName => {
+            video.addEventListener(eventName, (e) => {
+                log(`🎬 Video event: ${eventName}`);
+                
+                // Update player status based on video state
+                if (eventName === 'playing') {
+                    window.playerState = 'playing';
+                } else if (eventName === 'pause') {
+                    window.playerState = 'paused';
+                } else if (eventName === 'waiting' || eventName === 'stalled') {
+                    window.playerState = 'buffering';
+                } else if (eventName === 'ended') {
+                    window.playerState = 'ended';
+                } else if (eventName === 'error') {
+                    window.playerState = 'error';
+                    log(`❌ Video error: ${video.error?.code}, ${video.error?.message}`);
+                }
+                
+                updateUI();
+            });
+        });
+    }
+    
+    // Set up a timer to periodically check buffer state
+    if (window.bufferStateInterval) {
+        clearInterval(window.bufferStateInterval);
+    }
+    
+    window.bufferStateInterval = setInterval(() => {
+        if (!hls || !hls.media) return;
+        
+        const video = hls.media;
+        const buffered = [];
+        
+        for (let i = 0; i < video.buffered.length; i++) {
+            buffered.push({
+                start: video.buffered.start(i),
+                end: video.buffered.end(i)
+            });
+        }
+        
+        const currentTime = video.currentTime;
+        const bufferedAhead = getBufferedAheadOf(video.buffered, currentTime);
+        
+        log(`📊 Buffer state: currentTime=${currentTime.toFixed(2)}s, bufferedAhead=${bufferedAhead.toFixed(2)}s, ranges=${buffered.length}`);
+        
+        // Update fragments count in UI
+        const bufferStatus = document.getElementById('bufferStatus');
+        if (bufferStatus) {
+            const fragmentCount = window.hlsBufferState.video.appended + window.hlsBufferState.audio.appended;
+            bufferStatus.textContent = `${fragmentCount} fragments`;
+        }
+    }, 5000);
+    
+    log(`✅ HLS.js event monitoring setup completed`);
+    return true;
+}
+
+// Helper function to get amount of media buffered ahead of current position
+function getBufferedAheadOf(buffered, position) {
+    for (let i = 0; i < buffered.length; i++) {
+        const start = buffered.start(i);
+        const end = buffered.end(i);
+        
+        if (position >= start && position < end) {
+            return end - position;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -1767,6 +2188,7 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Initialize UI
     updateUI();
+    setupImprovedPlayButton();
     log(`🚀 Player initialized and ready`);
 });
     </script>
