@@ -462,7 +462,8 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
             // Optional: registerMediaSegment if you still use it elsewhere
             window.registerMediaSegment(0, segId, this.buffer.video[segId], segmentName);
 
-            videoPlaylist += `${blobUrl}\n`;
+            //videoPlaylist += `${blobUrl}\n`; -- HLS.js does not support "blob:http..."
+            videoPlaylist += `${segmentName}\n`;  // e.g., chunk-00513.ts
 
         }
         
@@ -745,7 +746,7 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
                 for (const [name, blobUrl] of window.segmentBlobUrlMap.entries()) {
                     try {
                         URL.revokeObjectURL(blobUrl);
-                        blobUrlMap.set(blobUrl, blob);
+                        window.segmentBlobUrlMap.clear();
                         log(`🧹 Revoked segment blob URL: ${name}`);
                     } catch (e) {
                         log(`⚠️ Error revoking segment URL "${name}": ${e.message}`);
@@ -1283,6 +1284,12 @@ function generateVideoPlaylist(packetHandler) {
                 playButton.disabled = false;
                 log(`✅ Play button enabled`);
             }
+            videoElement.play().then(() => {
+                log(`▶️ Autoplay success after manifest parsed`);
+            }).catch(err => {
+                log(`⚠️ Autoplay failed after manifest parsed: ${err.message}`);
+            });
+
         });
         
         // Level Events
