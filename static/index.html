@@ -193,6 +193,36 @@ window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
     log(`🔗 Registered segment: ${segmentName}`);
 };
 
+function startHlsPlayback(hlsUrl) {
+    const video = document.getElementById('videoElement');
+    if (!video) {
+        log("❌ No video element found!");
+        return;
+    }
+
+    if (Hls.isSupported()) {
+        const hls = new Hls();
+        hls.loadSource(hlsUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, function () {
+            log('🎬 HLS manifest parsed, attempting autoplay...');
+            video.play().catch(err => {
+                log(`⚠️ Autoplay failed: ${err.message}`);
+            });
+        });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = hlsUrl;
+        video.addEventListener('loadedmetadata', function () {
+            video.play().catch(err => {
+                log(`⚠️ Autoplay failed: ${err.message}`);
+            });
+        });
+    } else {
+        log('❌ HLS not supported in this browser.');
+    }
+}
+
+
 /**
  * WebTransportHLSPacketHandler class
  * 
@@ -492,6 +522,8 @@ WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
     if (typeof this.onHLSReady === 'function') {
         this.onHLSReady(this.hlsUrl);
     }
+
+    startHlsPlayback(this.hlsUrl);
 };
 
 WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
