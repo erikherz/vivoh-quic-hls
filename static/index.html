@@ -270,85 +270,49 @@ function startHlsPlayback(hlsUrl) {
         return this._countCompletePackets();
     }
     
-    /**
-     * Extract the next complete, validated packet from the buffer
-     * @return {Object|null} - Parsed packet or null if no complete packet is available
-     */
     extractPacket() {
-        // Check if we have enough data for at least a header
-        if (this.buffer.byteLength < this.HEADER_SIZE) {
-            return null;
-        }
-        
-        // Peek at header to validate and determine packet size
-        const headerView = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.HEADER_SIZE);
-        
-        // Extract header fields
-        const packetId = headerView.getUint32(0);
-        const timestamp = headerView.getBigUint64(4);
-        const duration = headerView.getUint32(12);
-        const segmentDuration = headerView.getFloat32(16);
-        
-        // Validate header fields
-        if (!this._isValidHeader(packetId, segmentDuration)) {
-            // Invalid header - discard the first byte and try again with shifted buffer
-            console.warn(`🚨 Invalid packet header detected (ID: ${packetId}, duration: ${segmentDuration}). Discarding byte to resync.`);
-            this.buffer = this.buffer.slice(1);
-            this.invalidPacketsRejected++;
-            return null;
-        }
-        
-        // Assuming AV data follows immediately after header
-        // Check if we have the complete packet (this is simplified, real impl might use length fields)
-        // For now, we'll assume each TS segment is at least a reasonable minimum size
-        const estimatedPacketSize = this.HEADER_SIZE + this.MIN_SEGMENT_SIZE;
-        
-        if (this.buffer.byteLength < estimatedPacketSize) {
-            // Not enough data yet, need more chunks
-            return null;
-        }
-        
-        // Check for MPEG-TS sync byte (0x47) at the start of AV data
-        if (this.buffer[this.HEADER_SIZE] !== 0x47) {
-            // No sync byte found - not a valid MPEG-TS packet
-            // Discard the first byte and try again
-            console.warn(`🚨 Invalid MPEG-TS sync byte. Expected 0x47, got 0x${this.buffer[this.HEADER_SIZE].toString(16)}. Discarding byte to resync.`);
-            this.buffer = this.buffer.slice(1);
-            this.invalidPacketsRejected++;
-            return null;
-        }
-        
-        // Scan for the next packet by looking for the sequence of valid header + sync byte
-        // This helps us determine the actual packet size
-        let nextPacketPos = this._findNextPacketStart(this.HEADER_SIZE + 1);
-        
-        // If we can't find the next packet start, use a minimum packet size
-        const packetSize = (nextPacketPos > 0) ? 
-            nextPacketPos : 
-            Math.min(this.buffer.byteLength, this.HEADER_SIZE + this.MIN_SEGMENT_SIZE);
-        
-        // Extract the complete packet
-        const packetData = this.buffer.slice(0, packetSize);
-        
-        // Update sequence tracking
-        this._updateSequenceTracking(packetId);
-        
-        // Remove the extracted packet from the buffer
-        this.buffer = this.buffer.slice(packetSize);
-        
-        // Update statistics
-        this.validPacketsExtracted++;
-        
-        // Return the parsed packet with metadata and AV data
-        return {
-            packetId,
-            timestamp,
-            duration,
-            segmentDuration,
-            avData: packetData.slice(this.HEADER_SIZE),
-            rawData: packetData
-        };
+    const HEADER_SIZE = 24;
+
+    if (this.buffer.byteLength < HEADER_SIZE) {
+        return null; // Not enough for even the header
     }
+
+    const view = new DataView(this.buffer.buffer, this.buffer.byteOffset, HEADER_SIZE);
+    const packetId = view.getUint32(0, false);         // Big endian
+    const timestamp = view.getBigUint64(4, false);     // Big endian
+    const duration = view.getUint32(12, false);
+    const segmentDuration = view.getFloat32(16, false);
+    const avDataLen = view.getUint32(20, false);
+
+    const totalSize = HEADER_SIZE + avDataLen;
+
+    if (this.buffer.byteLength < totalSize) {
+        return null; // Wait for more data
+    }
+
+    // Sync byte check (first byte of MPEG-TS should be 0x47)
+    const syncByte = this.buffer[HEADER_SIZE];
+    if (syncByte !== 0x47) {
+        console.warn(`🚨 Invalid MPEG-TS sync byte. Expected 0x47, got 0x${syncByte.toString(16)}. Discarding byte to resync.`);
+        this.buffer = this.buffer.slice(1);
+        return null;
+    }
+
+    // Slice the packet
+    const packet = this.buffer.slice(0, totalSize);
+    const avData = packet.slice(HEADER_SIZE);
+
+    // Remove packet from buffer
+    this.buffer = this.buffer.slice(totalSize);
+
+    return {
+        packetId,
+        timestamp,
+        duration,
+        segmentDuration,
+        avData
+    };
+}
     
     /**
      * Get all available complete packets
