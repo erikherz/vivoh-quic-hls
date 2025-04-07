@@ -226,9 +226,10 @@ function startHlsPlayback(hlsUrl) {
 }
 
 /**
- * WebTransportHLSPacketHandler class
+ * WebTransportHLSPacketHandler class with support for fragmented packets
  * 
  * Processes incoming media data from WebTransport and makes it available for HLS.js
+ * Enhanced to handle fragmented packets from WebTransport streams
  */
  class WebTransportHLSPacketHandler {
     constructor() {
@@ -251,12 +252,38 @@ function startHlsPlayback(hlsUrl) {
         
         // Event callback
         this.onHLSReady = null;
+        
+        // Track partial packets being assembled
+        this.partialPackets = {};
+        
+        // Enhanced stats
+        this.partialPacketsReceived = 0;
+        this.partialPacketsCompleted = 0;
+        
+        log("📦 WebTransport HLS Packet Handler with fragmentation support initialized");
     }
     
     /**
      * Process a validated packet directly
      */
     processValidatedPacket(packet) {
+        // Check if this is a complete packet
+        const isComplete = packet.avData && packet.avData.byteLength >= packet.avDataLen;
+        
+        if (isComplete) {
+            // Process complete packet directly
+            this._processCompletePacket(packet);
+        } else {
+            // Handle as a fragment for incomplete packets
+            this.processPacketFragment(packet, false);
+        }
+    }
+    
+    /**
+     * Process a complete packet that has all its data
+     * @private
+     */
+    _processCompletePacket(packet) {
         // Update tracking stats
         this.lastProcessedPacketId = packet.packetId;
         this.packetsReceived++;
@@ -285,6 +312,174 @@ function startHlsPlayback(hlsUrl) {
         }
     }
     
+    /**
+     * Process a partial packet fragment
+     * @param {Object} packet - The packet object with header and partial data
+     * @param {boolean} isComplete - Whether this is a complete packet
+     * @returns {boolean} - Whether the packet was processed successfully
+     */
+    processPacketFragment(packet, isComplete = false) {
+        // Increment counter
+        this.partialPacketsReceived++;
+        
+        // Get the packet ID for tracking
+        const packetId = packet.packetId;
+        
+        // If this is a new partial packet, initialize tracking
+        if (!this.partialPackets[packetId]) {
+            this.partialPackets[packetId] = {
+                header: {
+                    packetId: packet.packetId,
+                    timestamp: packet.timestamp,
+                    duration: packet.duration,
+                    segmentDuration: packet.segmentDuration,
+                    avDataLen: packet.avDataLen
+                },
+                fragments: [],
+                bytesReceived: 0,
+                totalSize: packet.avDataLen,
+                isComplete: false,
+                lastUpdated: Date.now()
+            };
+            
+            log(`📦 Started tracking partial packet #${packetId} (expected size: ${packet.avDataLen} bytes)`);
+        }
+        
+        // Add this fragment to the partial packet
+        const partialPacket = this.partialPackets[packetId];
+        partialPacket.fragments.push(packet.avData);
+        partialPacket.bytesReceived += packet.avData.byteLength;
+        partialPacket.lastUpdated = Date.now();
+        
+        // Log progress occasionally
+        if (this.partialPacketsReceived % 5 === 0 || partialPacket.bytesReceived >= partialPacket.totalSize) {
+            const percent = (partialPacket.bytesReceived / partialPacket.totalSize * 100).toFixed(1);
+            log(`📊 Packet #${packetId} assembly: ${partialPacket.bytesReceived}/${partialPacket.totalSize} bytes (${percent}%)`);
+        }
+        
+        // If fragment is complete or we've received all expected data, finalize the packet
+        if (isComplete || partialPacket.bytesReceived >= partialPacket.totalSize) {
+            // Mark as complete
+            partialPacket.isComplete = true;
+            this.partialPacketsCompleted++;
+            
+            // Assemble the complete packet by combining fragments
+            const assembledData = new Uint8Array(partialPacket.bytesReceived);
+            let offset = 0;
+            
+            for (const fragment of partialPacket.fragments) {
+                assembledData.set(fragment, offset);
+                offset += fragment.byteLength;
+            }
+            
+            // Create a complete packet object
+            const completePacket = {
+                ...partialPacket.header,
+                avData: assembledData
+            };
+            
+            // Process using the main packet processing method
+            this._processCompletePacket(completePacket);
+            
+            log(`✅ Completed packet #${packetId} (${partialPacket.bytesReceived} bytes) - processed successfully`);
+            
+            // Remove from tracking to free memory
+            delete this.partialPackets[packetId];
+            
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Process packet fragments from stream data directly
+     * This method allows processing smaller chunks without requiring the entire packet
+     */
+    processStreamChunk(streamId, chunk) {
+        if (!chunk || chunk.byteLength < 24) {
+            return false; // Too small to even contain a header
+        }
+        
+        try {
+            // Extract header fields from this chunk
+            const view = new DataView(chunk.buffer, chunk.byteOffset, 24); // Fixed header size of 24 bytes
+            
+            const packetId = view.getUint32(0, false);         // Big endian
+            const timestamp = view.getBigUint64(4, false);     // Big endian
+            const duration = view.getUint32(12, false);
+            const segmentDuration = view.getFloat32(16, false);
+            const avDataLen = view.getUint32(20, false);
+            
+            // Basic validation
+            if (!Number.isFinite(packetId) || packetId < 0 || packetId > 100000 ||
+                !Number.isFinite(segmentDuration) || segmentDuration <= 0 || segmentDuration > 10 ||
+                !Number.isFinite(avDataLen) || avDataLen <= 0 || avDataLen > 10 * 1024 * 1024) {
+                return false; // Invalid header
+            }
+            
+            // Create a packet object with the header data
+            const packet = {
+                packetId,
+                timestamp,
+                duration,
+                segmentDuration,
+                avDataLen,
+                avData: chunk.slice(24) // Data portion (after header)
+            };
+            
+            // Process this fragment
+            this.processPacketFragment(packet, chunk.byteLength >= 24 + avDataLen);
+            
+            return true;
+        } catch (error) {
+            log(`❌ Error processing stream chunk from stream #${streamId}: ${error.message}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Process HLS data (e.g., from a manifest stream)
+     */
+     _processHLSData(data) {
+        if (!data || data.byteLength === 0) return;
+        
+        try {
+            // Convert the binary data to a string
+            const hlsString = new TextDecoder().decode(data);
+            
+            // Check if this is an actual HLS manifest
+            if (hlsString.includes('#EXTM3U')) {
+                this.hlsData = hlsString;
+                log(`📄 Extracted HLS manifest (${data.byteLength} bytes)`);
+            } else {
+                // If it's not a valid HLS manifest, we'll need to generate one
+                log(`⚠️ MPD field doesn't contain a valid HLS manifest`);
+                this._generateHLSManifest();
+                return;
+            }
+            
+            // Create a Blob URL for the HLS if needed
+            if (typeof URL !== 'undefined' && URL.createObjectURL) {
+                const blob = new Blob([this.hlsData], { type: 'application/vnd.apple.mpegurl' });
+                this.hlsUrl = URL.createObjectURL(blob);
+                log(`🔗 Created HLS blob URL: ${this.hlsUrl}`);
+                
+                // Register the HLS blob URL 
+                if (typeof window.registerManifestBlobUrl === 'function') {
+                    window.registerManifestBlobUrl(this.hlsUrl, this.hlsData);
+                }
+            }
+            
+            // Notify that the HLS is ready
+            if (typeof this.onHLSReady === 'function') {
+                this.onHLSReady(this.hlsUrl);
+            }
+        } catch (error) {
+            log(`❌ Error processing HLS data: ${error.message}`);
+        }
+    }
+
     /**
      * Process an HLS segment 
      * - Simplified to handle multiplexed HLS segments
@@ -398,363 +593,360 @@ function startHlsPlayback(hlsUrl) {
         // Update HLS manifest if needed
         this._updateHLSManifest();
     }
-}
-/**
- * HLS Manifest Generation Methods for WebTransportHLSPacketHandler
- */
-
-/**
- * Process HLS data (e.g., from a manifest stream)
- */
- WebTransportHLSPacketHandler.prototype._processHLSData = function(data) {
-    if (!data || data.byteLength === 0) return;
     
-    try {
-        // Convert the binary data to a string
-        const hlsString = new TextDecoder().decode(data);
+    /**
+     * Generate HLS manifest from available segments
+     */
+    _generateHLSManifest() {
+        // Create a basic master playlist
+        let masterPlaylist = '#EXTM3U\n';
+        masterPlaylist += '#EXT-X-VERSION:3\n';
         
-        // Check if this is an actual HLS manifest
-        if (hlsString.includes('#EXTM3U')) {
-            this.hlsData = hlsString;
-            log(`📄 Extracted HLS manifest (${data.byteLength} bytes)`);
+        // Create a video media playlist using our improved generator
+        let videoPlaylist = this._generateVideoPlaylist();
+        
+        // Log full video playlist content to both console and UI
+        console.log("GENERATED VIDEO PLAYLIST:", videoPlaylist);
+        log(`📄 VIDEO PLAYLIST CONTENT:\n${videoPlaylist}`);
+        
+        // Create blob URLs for the playlists
+        const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
+        let videoPlaylistUrl = window.videoPlaylistUrl;
+        
+        if (!videoPlaylistUrl) {
+            videoPlaylistUrl = URL.createObjectURL(videoBlob);
+            window.videoPlaylistUrl = videoPlaylistUrl;
+            log(`🔗 Created new video playlist URL: ${videoPlaylistUrl}`);
         } else {
-            // If it's not a valid HLS manifest, we'll need to generate one
-            log(`⚠️ MPD field doesn't contain a valid HLS manifest`);
-            this._generateHLSManifest();
-            return;
+            // Just update the map without changing URL
+            log(`🔄 Updating existing video playlist URL: ${videoPlaylistUrl}`);
         }
         
-        // Create a Blob URL for the HLS if needed
-        if (typeof URL !== 'undefined' && URL.createObjectURL) {
-            const blob = new Blob([this.hlsData], { type: 'application/vnd.apple.mpegurl' });
-            this.hlsUrl = URL.createObjectURL(blob);
-            log(`🔗 Created HLS blob URL: ${this.hlsUrl}`);
-            
-            // Register the HLS blob URL 
-            if (typeof window.registerManifestBlobUrl === 'function') {
-                window.registerManifestBlobUrl(this.hlsUrl, this.hlsData);
-            }
+        // Now reference the video playlist URL in the master playlist
+        masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
+        masterPlaylist += `${videoPlaylistUrl}\n`;
+        
+        // Log full master playlist content to both console and UI
+        console.log("GENERATED MASTER PLAYLIST:", masterPlaylist);
+        log(`📄 MASTER PLAYLIST CONTENT:\n${masterPlaylist}`);
+        
+        // Create blob URL for master playlist
+        const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
+        let masterPlaylistUrl = window.masterPlaylistUrl;
+        
+        if (!masterPlaylistUrl) {
+            masterPlaylistUrl = URL.createObjectURL(masterBlob);
+            window.masterPlaylistUrl = masterPlaylistUrl;
+            this.hlsUrl = masterPlaylistUrl;
+            log(`🔗 Created new master playlist URL: ${masterPlaylistUrl}`);
+        } else {
+            // Just update the map without changing URL
+            this.hlsUrl = masterPlaylistUrl;
+            log(`🔄 Updating existing master playlist URL: ${masterPlaylistUrl}`);
         }
+        
+        // Make sure blobUrlMap is defined globally
+        if (!window.blobUrlMap) {
+            window.blobUrlMap = new Map();
+        }
+        
+        // Register all playlists for XHR interception
+        window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
+        window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
+        
+        // Also use the registerManifestBlobUrl function if available
+        if (typeof window.registerManifestBlobUrl === 'function') {
+            window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
+            window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
+        }
+        
+        log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
         
         // Notify that the HLS is ready
         if (typeof this.onHLSReady === 'function') {
             this.onHLSReady(this.hlsUrl);
         }
-    } catch (error) {
-        log(`❌ Error processing HLS data: ${error.message}`);
-    }
-};
 
-/**
- * Generate HLS manifest from available segments
- */
-WebTransportHLSPacketHandler.prototype._generateHLSManifest = function() {
-    // Create a basic master playlist
-    let masterPlaylist = '#EXTM3U\n';
-    masterPlaylist += '#EXT-X-VERSION:3\n';
-    
-    // Create a video media playlist using our improved generator
-    let videoPlaylist = this._generateVideoPlaylist();
-    
-    // Log full video playlist content to both console and UI
-    console.log("GENERATED VIDEO PLAYLIST:", videoPlaylist);
-    log(`📄 VIDEO PLAYLIST CONTENT:\n${videoPlaylist}`);
-    
-    // Create blob URLs for the playlists
-    const videoBlob = new Blob([videoPlaylist], { type: 'application/vnd.apple.mpegurl' });
-    let videoPlaylistUrl = window.videoPlaylistUrl;
-    
-    if (!videoPlaylistUrl) {
-        videoPlaylistUrl = URL.createObjectURL(videoBlob);
-        window.videoPlaylistUrl = videoPlaylistUrl;
-        log(`🔗 Created new video playlist URL: ${videoPlaylistUrl}`);
-    } else {
-        // Just update the map without changing URL
-        log(`🔄 Updating existing video playlist URL: ${videoPlaylistUrl}`);
-    }
-    
-    // Now reference the video playlist URL in the master playlist
-    masterPlaylist += `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"\n`;
-    masterPlaylist += `${videoPlaylistUrl}\n`;
-    
-    // Log full master playlist content to both console and UI
-    console.log("GENERATED MASTER PLAYLIST:", masterPlaylist);
-    log(`📄 MASTER PLAYLIST CONTENT:\n${masterPlaylist}`);
-    
-    // Create blob URL for master playlist
-    const masterBlob = new Blob([masterPlaylist], { type: 'application/vnd.apple.mpegurl' });
-    let masterPlaylistUrl = window.masterPlaylistUrl;
-    
-    if (!masterPlaylistUrl) {
-        masterPlaylistUrl = URL.createObjectURL(masterBlob);
-        window.masterPlaylistUrl = masterPlaylistUrl;
-        this.hlsUrl = masterPlaylistUrl;
-        log(`🔗 Created new master playlist URL: ${masterPlaylistUrl}`);
-    } else {
-        // Just update the map without changing URL
-        this.hlsUrl = masterPlaylistUrl;
-        log(`🔄 Updating existing master playlist URL: ${masterPlaylistUrl}`);
-    }
-    
-    // Make sure blobUrlMap is defined globally
-    if (!window.blobUrlMap) {
-        window.blobUrlMap = new Map();
-    }
-    
-    // Register all playlists for XHR interception
-    window.blobUrlMap.set(this.hlsUrl, masterPlaylist);
-    window.blobUrlMap.set(videoPlaylistUrl, videoPlaylist);
-    
-    // Also use the registerManifestBlobUrl function if available
-    if (typeof window.registerManifestBlobUrl === 'function') {
-        window.registerManifestBlobUrl(this.hlsUrl, masterPlaylist);
-        window.registerManifestBlobUrl(videoPlaylistUrl, videoPlaylist);
-    }
-    
-    log(`✅ Generated HLS manifests and registered blob URLs: Master=${this.hlsUrl}, Video=${videoPlaylistUrl}`);
-    
-    // Notify that the HLS is ready
-    if (typeof this.onHLSReady === 'function') {
-        this.onHLSReady(this.hlsUrl);
+        // Try to start playback
+        if (typeof startHlsPlayback === 'function') {
+            startHlsPlayback(this.hlsUrl);
+        }
     }
 
-    // Try to start playback
-    if (typeof startHlsPlayback === 'function') {
-        startHlsPlayback(this.hlsUrl);
-    }
-};
-
-/**
- * Update the HLS manifest with new segments
- */
-WebTransportHLSPacketHandler.prototype._updateHLSManifest = function() {
-    // Only update occasionally to avoid excessive regeneration
-    if (Math.random() > 0.2) return; // Only update ~20% of the time
-    
-    // Generate new manifests with updated segment lists
-    this._generateHLSManifest();
-    log(`🔄 Updated HLS manifests with new fragments`);
-};
-
-/**
- * Generate the video playlist with available segments
- */
-WebTransportHLSPacketHandler.prototype._generateVideoPlaylist = function() {
-    // Constants for validation
-    const MIN_SEGMENT_SIZE = 50 * 1024; // 50 KB minimum size
-    const MAX_SEGMENT_ID = 100000;      // Maximum reasonable segment ID
-    const MAX_ALLOWED_GAP = 5;          // Maximum allowed gap in sequence
-
-    // Create the basic playlist structure
-    let videoPlaylist = '#EXTM3U\n';
-    videoPlaylist += '#EXT-X-VERSION:3\n';
-    videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
-    videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
-
-    // Get all segments, filter and sort them
-    const segmentIds = Object.keys(this.segments)
-        .map(Number)
-        .filter(id => {
-            // Basic validation
-            if (!Number.isFinite(id) || id < 0 || id > MAX_SEGMENT_ID) {
-                log(`⚠️ Filtering out invalid segment ID: ${id}`);
-                return false;
-            }
-            
-            // Size validation
-            const segment = this.segments[id];
-            if (!segment || !segment.byteLength || segment.byteLength < MIN_SEGMENT_SIZE) {
-                log(`⚠️ Filtering out small segment #${id} (size=${segment?.byteLength || 0})`);
-                return false;
-            }
-            
-            return true;
-        })
-        .sort((a, b) => a - b);
-
-    // Handle empty case
-    if (segmentIds.length === 0) {
-        videoPlaylist += '#EXTINF:4.0,\n';
-        videoPlaylist += 'chunk-00000.ts\n';
+    /**
+     * Update the HLS manifest with new segments
+     */
+    _updateHLSManifest() {
+        // Only update occasionally to avoid excessive regeneration
+        if (Math.random() > 0.2) return; // Only update ~20% of the time
         
+        // Generate new manifests with updated segment lists
+        this._generateHLSManifest();
+        log(`🔄 Updated HLS manifests with new fragments`);
+    }
+
+    /**
+     * Generate the video playlist with available segments
+     */
+    _generateVideoPlaylist() {
+        // Constants for validation
+        const MIN_SEGMENT_SIZE = 50 * 1024; // 50 KB minimum size
+        const MAX_SEGMENT_ID = 100000;      // Maximum reasonable segment ID
+        const MAX_ALLOWED_GAP = 5;          // Maximum allowed gap in sequence
+
+        // Create the basic playlist structure
+        let videoPlaylist = '#EXTM3U\n';
+        videoPlaylist += '#EXT-X-VERSION:3\n';
+        videoPlaylist += '#EXT-X-TARGETDURATION:4\n';
+        videoPlaylist += '#EXT-X-MEDIA-SEQUENCE:0\n';
+
+        // Get all segments, filter and sort them
+        const segmentIds = Object.keys(this.segments)
+            .map(Number)
+            .filter(id => {
+                // Basic validation
+                if (!Number.isFinite(id) || id < 0 || id > MAX_SEGMENT_ID) {
+                    log(`⚠️ Filtering out invalid segment ID: ${id}`);
+                    return false;
+                }
+                
+                // Size validation
+                const segment = this.segments[id];
+                if (!segment || !segment.byteLength || segment.byteLength < MIN_SEGMENT_SIZE) {
+                    log(`⚠️ Filtering out small segment #${id} (size=${segment?.byteLength || 0})`);
+                    return false;
+                }
+                
+                return true;
+            })
+            .sort((a, b) => a - b);
+
+        // Handle empty case
+        if (segmentIds.length === 0) {
+            videoPlaylist += '#EXTINF:4.0,\n';
+            videoPlaylist += 'chunk-00000.ts\n';
+            
+            // Register with our manifest blob map
+            if (typeof window.registerManifestBlobUrl === 'function') {
+                window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
+            }
+            
+            return videoPlaylist;
+        }
+
+        // Process segments with sequence validation
+        let includedCount = 0;
+        let lastIncludedId = null;
+
+        for (let i = 0; i < segmentIds.length; i++) {
+            const segId = segmentIds[i];
+            const segment = this.segments[segId];
+            
+            // Skip non-sequential segments (prevent large gaps)
+            if (lastIncludedId !== null && (segId - lastIncludedId) > MAX_ALLOWED_GAP) {
+                log(`⚠️ Skipping out-of-sequence segment #${segId} (last was #${lastIncludedId})`);
+                continue;
+            }
+            
+            // Find segment duration from fragments if available
+            let segmentDuration = 4.0; // Default
+            const segmentInfo = this.fragments.find(f => f.sequence === segId);
+            
+            if (segmentInfo && Number.isFinite(segmentInfo.segmentDuration) && 
+                segmentInfo.segmentDuration > 0 && segmentInfo.segmentDuration <= 10) {
+                segmentDuration = segmentInfo.segmentDuration;
+            }
+
+            // Add segment to playlist with proper formatting
+            videoPlaylist += `#EXTINF:${segmentDuration.toFixed(3)},\n`;
+            const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
+            videoPlaylist += `${segmentName}\n`;
+
+            lastIncludedId = segId;
+            includedCount++;
+        }
+
+        // Add end list marker if disconnected
+        if (this.isDisconnected) {
+            videoPlaylist += '#EXT-X-ENDLIST\n';
+        }
+
         // Register with our manifest blob map
         if (typeof window.registerManifestBlobUrl === 'function') {
             window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
         }
         
+        log(`📄 Generated video playlist with ${includedCount} valid segments`);
         return videoPlaylist;
     }
-
-    // Process segments with sequence validation
-    let includedCount = 0;
-    let lastIncludedId = null;
-
-    for (let i = 0; i < segmentIds.length; i++) {
-        const segId = segmentIds[i];
-        const segment = this.segments[segId];
-        
-        // Skip non-sequential segments (prevent large gaps)
-        if (lastIncludedId !== null && (segId - lastIncludedId) > MAX_ALLOWED_GAP) {
-            log(`⚠️ Skipping out-of-sequence segment #${segId} (last was #${lastIncludedId})`);
-            continue;
+    
+    /**
+     * Check if we have enough data to start playback
+     */
+    _checkPlaybackReadiness() {
+        // If player already exists, don't create another one
+        if (window.player) {
+            return;
         }
         
-        // Find segment duration from fragments if available
-        let segmentDuration = 4.0; // Default
-        const segmentInfo = this.fragments.find(f => f.sequence === segId);
+        // Check if we have HLS data or enough fragments to generate it
+        const hasHLS = this.hlsData !== null;
         
-        if (segmentInfo && Number.isFinite(segmentInfo.segmentDuration) && 
-            segmentInfo.segmentDuration > 0 && segmentInfo.segmentDuration <= 10) {
-            segmentDuration = segmentInfo.segmentDuration;
-        }
-
-        // Add segment to playlist with proper formatting
-        videoPlaylist += `#EXTINF:${segmentDuration.toFixed(3)},\n`;
-        const segmentName = `chunk-${segId.toString().padStart(5, '0')}.ts`;
-        videoPlaylist += `${segmentName}\n`;
-
-        lastIncludedId = segId;
-        includedCount++;
-    }
-
-    // Add end list marker if disconnected
-    if (this.isDisconnected) {
-        videoPlaylist += '#EXT-X-ENDLIST\n';
-    }
-
-    // Register with our manifest blob map
-    if (typeof window.registerManifestBlobUrl === 'function') {
-        window.registerManifestBlobUrl('video.m3u8', videoPlaylist);
-    }
-    
-    log(`📄 Generated video playlist with ${includedCount} valid segments`);
-    return videoPlaylist;
-};
-/**
- * Utility Methods for WebTransportHLSPacketHandler
- */
-
-/**
- * Check if we have enough data to start playback
- */
- WebTransportHLSPacketHandler.prototype._checkPlaybackReadiness = function() {
-    // If player already exists, don't create another one
-    if (window.player) {
-        return;
-    }
-    
-    // Check if we have HLS data or enough fragments to generate it
-    const hasHLS = this.hlsData !== null;
-    
-    // Check if we have enough fragments
-    const segmentCount = Object.keys(this.segments).length;
-    
-    // Wait until we have enough data to start playback
-    if (hasHLS && segmentCount >= 3) {
-        log(`✅ Media ready: HLS=${hasHLS}, Segments=${segmentCount}`);
+        // Check if we have enough fragments
+        const segmentCount = Object.keys(this.segments).length;
         
-        // Notify that we're ready to initialize the player
-        if (typeof this.onHLSReady === 'function') {
-            this.onHLSReady(this.hlsUrl);
+        // Wait until we have enough data to start playback
+        if (hasHLS && segmentCount >= 3) {
+            log(`✅ Media ready: HLS=${hasHLS}, Segments=${segmentCount}`);
+            
+            // Notify that we're ready to initialize the player
+            if (typeof this.onHLSReady === 'function') {
+                this.onHLSReady(this.hlsUrl);
+            }
+        } else if (!hasHLS && segmentCount >= 3) {
+            // We have enough fragments but no HLS manifest - generate one
+            this._generateHLSManifest();
         }
-    } else if (!hasHLS && segmentCount >= 3) {
-        // We have enough fragments but no HLS manifest - generate one
-        this._generateHLSManifest();
     }
-};
 
-/**
- * Get a segment by ID
- */
-WebTransportHLSPacketHandler.prototype.getSegment = function(segmentId) {
-    // Try to find exact segment ID
-    if (this.segments[segmentId]) {
-        return this.segments[segmentId];
-    }
-    
-    // If not found, get closest segment ID
-    const keys = Object.keys(this.segments).map(Number).sort((a, b) => a - b);
-    
-    // Find closest segment (prefer newer segments)
-    if (keys.length > 0) {
-        // Sort by closeness to the requested segment ID
-        keys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId));
-        const closestId = keys[0];
+    /**
+     * Get a segment by ID
+     */
+    getSegment(segmentId) {
+        // Try to find exact segment ID
+        if (this.segments[segmentId]) {
+            return this.segments[segmentId];
+        }
         
-        log(`⚠️ Segment #${segmentId} not found, using closest #${closestId}`);
-        return this.segments[closestId];
-    }
-    
-    return null;
-};
-
-/**
- * Get stats about the received media
- */
-WebTransportHLSPacketHandler.prototype.getStats = function() {
-    const segmentCount = Object.keys(this.segments).length;
-    
-    return {
-        bytesReceived: this.bytesReceived,
-        fragments: this.fragments.length,
-        segmentsAvailable: segmentCount,
-        fragmentsReceived: this.fragmentsReceived,
-        packetsReceived: this.packetsReceived,
-        hlsAvailable: this.hlsData !== null
-    };
-};
-
-/**
- * Disconnect and clean up resources
- */
-WebTransportHLSPacketHandler.prototype.disconnect = function() {
-    this.isDisconnected = true;
-    log(`🧹 Cleaning up packet handler resources`);
-    
-    // Clear segments
-    this.segments = {};
-    
-    // Clear fragments
-    this.fragments = [];
-    
-    // Clean up all blob URLs
-    if (window.masterPlaylistUrl) {
-        try {
-            URL.revokeObjectURL(window.masterPlaylistUrl);
-            log(`🧹 Revoked master playlist URL: ${window.masterPlaylistUrl}`);
-            window.masterPlaylistUrl = null;
-        } catch (e) {
-            log(`⚠️ Error revoking master playlist URL: ${e.message}`);
+        // If not found, get closest segment ID
+        const keys = Object.keys(this.segments).map(Number).sort((a, b) => a - b);
+        
+        // Find closest segment (prefer newer segments)
+        if (keys.length > 0) {
+            // Sort by closeness to the requested segment ID
+            keys.sort((a, b) => Math.abs(a - segmentId) - Math.abs(b - segmentId));
+            const closestId = keys[0];
+            
+            log(`⚠️ Segment #${segmentId} not found, using closest #${closestId}`);
+            return this.segments[closestId];
         }
+        
+        return null;
+    }
+
+    /**
+     * Get stats about the received media
+     */
+    getStats() {
+        const segmentCount = Object.keys(this.segments).length;
+        
+        return {
+            bytesReceived: this.bytesReceived,
+            fragments: this.fragments.length,
+            segmentsAvailable: segmentCount,
+            fragmentsReceived: this.fragmentsReceived,
+            packetsReceived: this.packetsReceived,
+            hlsAvailable: this.hlsData !== null,
+            partialPackets: Object.keys(this.partialPackets).length,
+            partialPacketsReceived: this.partialPacketsReceived,
+            partialPacketsCompleted: this.partialPacketsCompleted
+        };
     }
     
-    if (window.videoPlaylistUrl) {
-        try {
-            URL.revokeObjectURL(window.videoPlaylistUrl);
-            log(`🧹 Revoked video playlist URL: ${window.videoPlaylistUrl}`);
-            window.videoPlaylistUrl = null;
-        } catch (e) {
-            log(`⚠️ Error revoking video playlist URL: ${e.message}`);
-        }
+    /**
+     * Get detailed statistics about partial packets
+     */
+    getPartialStats() {
+        return {
+            activePartials: Object.keys(this.partialPackets).length,
+            totalPartialPackets: this.partialPacketsReceived,
+            completedPartialPackets: this.partialPacketsCompleted
+        };
     }
     
-    // Revoke segment blob URLs
-    if (window.segmentBlobUrlMap) {
-        for (const [name, blobUrl] of window.segmentBlobUrlMap.entries()) {
-            try {
-                URL.revokeObjectURL(blobUrl);
-                log(`🧹 Revoked segment blob URL: ${name}`);
-            } catch (e) {
-                log(`⚠️ Error revoking segment URL "${name}": ${e.message}`);
+    /**
+     * Periodic maintenance to check partial packet status
+     */
+    checkPartialPackets() {
+        const now = Date.now();
+        const staleTimeout = 30000; // 30 seconds
+        
+        for (const [packetId, partial] of Object.entries(this.partialPackets)) {
+            // Check if this partial packet is stale
+            if (now - partial.lastUpdated > staleTimeout) {
+                // If we have enough data, try to process it anyway
+                if (partial.bytesReceived > partial.totalSize * 0.9) {
+                    log(`⚠️ Processing stale partial packet #${packetId} with ${partial.bytesReceived}/${partial.totalSize} bytes (${(partial.bytesReceived/partial.totalSize*100).toFixed(1)}%)`);
+                    
+                    // Force process as complete
+                    this.processPacketFragment({
+                        ...partial.header,
+                        avData: partial.fragments[0] // Just use first fragment as example
+                    }, true);
+                } else {
+                    // Remove stale data
+                    log(`🧹 Removing stale partial packet #${packetId} (${partial.bytesReceived}/${partial.totalSize} bytes, age: ${((now - partial.lastUpdated)/1000).toFixed(1)}s)`);
+                    delete this.partialPackets[packetId];
+                }
             }
         }
-        window.segmentBlobUrlMap.clear();
     }
-    
-    // Clear HLS data
-    this.hlsData = null;
-    this.hlsUrl = '/vivoh.m3u8';
-};
+
+    /**
+     * Disconnect and clean up resources
+     */
+    disconnect() {
+        this.isDisconnected = true;
+        log(`🧹 Cleaning up packet handler resources`);
+        
+        // Clear segments
+        this.segments = {};
+        
+        // Clear fragments
+        this.fragments = [];
+        
+        // Clean up partial packets
+        this.partialPackets = {};
+        
+        // Clean up all blob URLs
+        if (window.masterPlaylistUrl) {
+            try {
+                URL.revokeObjectURL(window.masterPlaylistUrl);
+                log(`🧹 Revoked master playlist URL: ${window.masterPlaylistUrl}`);
+                window.masterPlaylistUrl = null;
+            } catch (e) {
+                log(`⚠️ Error revoking master playlist URL: ${e.message}`);
+            }
+        }
+        
+        if (window.videoPlaylistUrl) {
+            try {
+                URL.revokeObjectURL(window.videoPlaylistUrl);
+                log(`🧹 Revoked video playlist URL: ${window.videoPlaylistUrl}`);
+                window.videoPlaylistUrl = null;
+            } catch (e) {
+                log(`⚠️ Error revoking video playlist URL: ${e.message}`);
+            }
+        }
+        
+        // Revoke segment blob URLs
+        if (window.segmentBlobUrlMap) {
+            for (const [name, blobUrl] of window.segmentBlobUrlMap.entries()) {
+                try {
+                    URL.revokeObjectURL(blobUrl);
+                    log(`🧹 Revoked segment blob URL: ${name}`);
+                } catch (e) {
+                    log(`⚠️ Error revoking segment URL "${name}": ${e.message}`);
+                }
+            }
+            window.segmentBlobUrlMap.clear();
+        }
+        
+        // Clear HLS data
+        this.hlsData = null;
+        this.hlsUrl = '/vivoh.m3u8';
+    }
+}
 
 /**
  * Enhanced WebTransportStreamBuffer with added debugging and improved packet detection
@@ -1081,9 +1273,8 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
 }
 
 /**
- * Enhanced function to handle a single incoming WebTransport stream
- * - Improved debugging and error handling
- * - Detects stream format issues
+ * Handle a single incoming WebTransport stream with support for fragmented packets
+ * This version processes each chunk directly without requiring complete packets
  */
  async function handleIncomingStream(stream, packetHandler) {
     // Generate a unique ID for this stream
@@ -1093,129 +1284,97 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
     const reader = stream.getReader();
     window.activeReaders.push(reader);
     
-    // Create a dedicated buffer manager for this stream
-    const streamBuffer = new WebTransportStreamBuffer(streamId);
-    
-    // Track stream performance
-    const streamStartTime = Date.now();
-    let lastProgressTime = streamStartTime;
-    let emptyReadCount = 0;
+    // Stats tracking
+    let totalBytesReceived = 0;
+    let chunksReceived = 0;
+    let lastLogTime = Date.now();
     
     try {
         log(`📥 Processing incoming stream #${streamId}`);
         
-        // Process the stream data
         while (!window.disconnectionRequested) {
             const { value, done } = await reader.read();
             
-            // Check if stream has ended
             if (done) {
-                const runTime = (Date.now() - streamStartTime) / 1000;
-                log(`📤 Stream #${streamId} ended after ${runTime.toFixed(1)}s`);
+                log(`📤 Stream #${streamId} ended after receiving ${totalBytesReceived} total bytes`);
                 break;
             }
             
-            // Handle empty chunks
             if (!value || value.byteLength === 0) {
-                emptyReadCount++;
-                
-                // Log occasional warnings if we're getting too many empty reads
-                if (emptyReadCount % 50 === 0) {
-                    log(`⚠️ Stream #${streamId} received ${emptyReadCount} empty reads`);
-                }
                 continue;
             }
             
-            // Reset empty read counter since we got data
-            emptyReadCount = 0;
+            // Update stats
+            chunksReceived++;
+            totalBytesReceived += value.byteLength;
             
-            // Add this chunk to the stream's buffer
-            streamBuffer.addChunk(value);
-            
-            // Extract and process any complete packets
-            let packetsInThisRead = 0;
-            let packet;
-            
-            while ((packet = streamBuffer.extractPacket()) !== null) {
-                // Process the packet with the handler
-                packetHandler.processValidatedPacket(packet);
-                packetsInThisRead++;
-                
-                // Update UI counter
-                const packetCounter = document.getElementById('packetCounter');
-                if (packetCounter) {
-                    packetCounter.textContent = packetHandler.packetsReceived.toString();
-                }
-            }
-            
-            // Log progress if we processed packets
-            if (packetsInThisRead > 0) {
-                log(`✅ Stream #${streamId} processed ${packetsInThisRead} packets from last read (${value.byteLength} bytes)`);
-                lastProgressTime = Date.now();
+            // Process chunk directly with packet handler
+            if (typeof packetHandler.processStreamChunk === 'function') {
+                // Direct chunk processing for fragmentation support
+                packetHandler.processStreamChunk(streamId, value);
             } else {
-                // Log if we haven't made progress in a while
-                const timeSinceProgress = Date.now() - lastProgressTime;
-                if (timeSinceProgress > 5000) { // 5 seconds
-                    // Get detailed stats
-                    const stats = streamBuffer.getStats();
+                // Create a buffer if needed (fallback to original method)
+                if (!streamBuffer) {
+                    const streamBuffer = new WebTransportStreamBuffer(streamId);
+                }
+                
+                // Add this chunk to the stream's buffer
+                streamBuffer.addChunk(value);
+                
+                // Extract and process any complete packets
+                let packet;
+                while ((packet = streamBuffer.extractPacket()) !== null) {
+                    // Process the packet with the handler
+                    packetHandler.processValidatedPacket(packet);
                     
-                    // Log detailed buffer information for debugging
-                    log(`⚠️ Stream #${streamId} no packets found in ${(timeSinceProgress/1000).toFixed(1)}s: Size=${stats.bufferSize}B, Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}`);
-                    
-                    // If buffer is large but we've never extracted a packet, something might be wrong
-                    if (stats.bufferSize > 10000 && stats.validPacketsExtracted === 0) {
-                        // Log the first part of the buffer for debugging
-                        const bufferSample = streamBuffer.buffer.slice(0, Math.min(64, streamBuffer.buffer.byteLength));
-                        const hexSample = Array.from(bufferSample)
-                            .map(b => b.toString(16).padStart(2, '0'))
-                            .join(' ');
-                        
-                        log(`🔍 Stream #${streamId} buffer sample: ${hexSample}`);
-                        
-                        // Try to interpret as text
-                        try {
-                            const textSample = new TextDecoder().decode(bufferSample);
-                            const printableSample = textSample.replace(/[^\x20-\x7E]/g, '.'); // Replace non-printable with dots
-                            log(`🔍 Stream #${streamId} as text: ${printableSample}`);
-                        } catch (e) {
-                            // Ignore text decoding errors
-                        }
-                        
-                        // Only log this once per stream
-                        lastProgressTime = Date.now();
+                    // Update UI counter
+                    const packetCounter = document.getElementById('packetCounter');
+                    if (packetCounter) {
+                        packetCounter.textContent = packetHandler.packetsReceived.toString();
                     }
                 }
             }
             
-            // Periodically log buffer stats
-            if (packetHandler.packetsReceived % 50 === 0 && packetHandler.packetsReceived > 0) {
-                const stats = streamBuffer.getStats();
-                log(`📊 Stream #${streamId} buffer stats: Size=${stats.bufferSize}B, Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}`);
+            // Log progress periodically
+            const now = Date.now();
+            if (now - lastLogTime > 5000) { // Every 5 seconds
+                log(`📊 Stream #${streamId} progress: ${chunksReceived} chunks, ${totalBytesReceived} bytes total`);
+                
+                // For enhanced handler, also log partial packet stats
+                if (typeof packetHandler.getPartialStats === 'function') {
+                    const stats = packetHandler.getPartialStats();
+                    log(`📊 Partial packets: ${stats.activePartials} active, ${stats.completedPartialPackets}/${stats.totalPartialPackets} completed`);
+                }
+                
+                // Run maintenance on partial packets
+                if (typeof packetHandler.checkPartialPackets === 'function') {
+                    packetHandler.checkPartialPackets();
+                }
+                
+                lastLogTime = now;
+            }
+            
+            // Update UI
+            const packetCounter = document.getElementById('packetCounter');
+            if (packetCounter) {
+                packetCounter.textContent = packetHandler.packetsReceived.toString();
             }
         }
     } catch (error) {
         log(`❌ Error in stream #${streamId}: ${error.message}`);
     } finally {
         try {
-            // Release the reader lock
             reader.releaseLock();
-            
-            // Log final stats
-            const stats = streamBuffer.getStats();
-            const runTime = (Date.now() - streamStartTime) / 1000;
-            
-            log(`📊 Stream #${streamId} final stats: Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}, Received=${stats.totalBytesReceived}B, Duration=${runTime.toFixed(1)}s`);
         } catch (e) {
             // Ignore errors during cleanup
         }
         
-        // Remove from active readers
         const index = window.activeReaders.indexOf(reader);
         if (index !== -1) {
             window.activeReaders.splice(index, 1);
         }
         
-        log(`🛑 Stream #${streamId} processing completed`);
+        log(`🛑 Stream #${streamId} processing completed: ${totalBytesReceived} bytes total`);
     }
 }
 
@@ -2811,14 +2970,18 @@ function setupPacketHandlerCallbacks() {
     log("✅ Packet handler callbacks configured");
 }
 
-function setupWebTransport(url) {
+/**
+ * Set up WebTransport with enhanced fragmentation support
+ * This version uses the enhanced packet handler and stream processor
+ */
+ function setupWebTransport(url) {
     try {
         window.disconnectionRequested = false;
         
         log(`🔍 Setting up WebTransport with URL: ${url}`);
         
         // Reset fragment counter
-        fragmentCounter = 0;
+        window.fragmentCounter = 0;
         
         // Clear any existing resources
         if (window.transport) {
@@ -2874,6 +3037,13 @@ function setupWebTransport(url) {
         
         // Update play button handler
         updatePlayButton();
+        
+        // Start periodic maintenance for partial packets
+        window.partialPacketInterval = setInterval(() => {
+            if (typeof window.packetHandler.checkPartialPackets === 'function') {
+                window.packetHandler.checkPartialPackets();
+            }
+        }, 10000); // Every 10 seconds
         
         log(`✅ WebTransport setup completed successfully`);
         
@@ -3154,10 +3324,16 @@ function getBufferedAheadOf(buffered, position) {
 }
 
 /**
- * Handle connection close events
+ * Handle connection close events with enhanced cleanup
  */
-function handleConnectionClosed() {
+ function handleConnectionClosed() {
     log("🛑 Connection closed");
+    
+    // Clear our maintenance interval
+    if (window.partialPacketInterval) {
+        clearInterval(window.partialPacketInterval);
+        window.partialPacketInterval = null;
+    }
     
     // Update UI
     document.getElementById('connectionStatus').textContent = "Disconnected";
