@@ -313,12 +313,19 @@ function startHlsPlayback(hlsUrl) {
     }
     
     /**
-     * Process a partial packet fragment
+     * Process a partial packet fragment with enhanced validation and logging
+     * 
      * @param {Object} packet - The packet object with header and partial data
      * @param {boolean} isComplete - Whether this is a complete packet
      * @returns {boolean} - Whether the packet was processed successfully
      */
     processPacketFragment(packet, isComplete = false) {
+        // Validate input
+        if (!packet || !packet.packetId) {
+            log(`❌ Invalid packet fragment received`);
+            return false;
+        }
+        
         // Increment counter
         this.partialPacketsReceived++;
         
@@ -327,12 +334,19 @@ function startHlsPlayback(hlsUrl) {
         
         // If this is a new partial packet, initialize tracking
         if (!this.partialPackets[packetId]) {
+            // Ensure avDataLen is a valid number before proceeding
+            if (!Number.isFinite(packet.avDataLen) || packet.avDataLen <= 0 || packet.avDataLen > 10 * 1024 * 1024) {
+                log(`❌ Invalid packet size for #${packetId}: ${packet.avDataLen || 'undefined'}`);
+                return false;
+            }
+
+            // Initialize the tracking structure
             this.partialPackets[packetId] = {
                 header: {
                     packetId: packet.packetId,
                     timestamp: packet.timestamp,
                     duration: packet.duration,
-                    segmentDuration: packet.segmentDuration,
+                    segmentDuration: packet.segmentDuration || 1.0, // Default to 1.0 if not provided
                     avDataLen: packet.avDataLen
                 },
                 fragments: [],
@@ -347,12 +361,22 @@ function startHlsPlayback(hlsUrl) {
         
         // Add this fragment to the partial packet
         const partialPacket = this.partialPackets[packetId];
+        
+        // Skip if packet data is null or empty
+        if (!packet.avData || packet.avData.byteLength === 0) {
+            log(`⚠️ Empty fragment for packet #${packetId}, skipping`);
+            return false;
+        }
+        
+        // Add the fragment to our collection
         partialPacket.fragments.push(packet.avData);
         partialPacket.bytesReceived += packet.avData.byteLength;
         partialPacket.lastUpdated = Date.now();
         
-        // Log progress occasionally
-        if (this.partialPacketsReceived % 5 === 0 || partialPacket.bytesReceived >= partialPacket.totalSize) {
+        // Log progress on fixed intervals or completion
+        const progressThreshold = Math.min(5, Math.max(1, Math.floor(partialPacket.totalSize / 500000)));
+        if (this.partialPacketsReceived % progressThreshold === 0 || 
+            partialPacket.bytesReceived >= partialPacket.totalSize) {
             const percent = (partialPacket.bytesReceived / partialPacket.totalSize * 100).toFixed(1);
             log(`📊 Packet #${packetId} assembly: ${partialPacket.bytesReceived}/${partialPacket.totalSize} bytes (${percent}%)`);
         }
@@ -368,20 +392,45 @@ function startHlsPlayback(hlsUrl) {
             let offset = 0;
             
             for (const fragment of partialPacket.fragments) {
-                assembledData.set(fragment, offset);
+                assembledData.set(new Uint8Array(fragment), offset);
                 offset += fragment.byteLength;
             }
             
-            // Create a complete packet object
+            // Verify the assembled data
+            if (assembledData.byteLength === 0) {
+                log(`❌ Failed to assemble packet #${packetId} - empty result`);
+                delete this.partialPackets[packetId];
+                return false;
+            }
+            
+            // Create a complete packet object with ALL header fields
             const completePacket = {
-                ...partialPacket.header,
+                packetId: partialPacket.header.packetId,
+                timestamp: partialPacket.header.timestamp,
+                duration: partialPacket.header.duration,
+                segmentDuration: partialPacket.header.segmentDuration,
+                avDataLen: partialPacket.bytesReceived,  // Use actual received bytes
                 avData: assembledData
             };
             
-            // Process using the main packet processing method
+            // Check if this is a valid MPEG-TS packet (first byte should be 0x47)
+            const isMpegTs = assembledData.byteLength > 0 && assembledData[0] === 0x47;
+            log(`✅ Completed packet #${packetId} (${partialPacket.bytesReceived} bytes, valid MPEG-TS: ${isMpegTs ? 'Yes' : 'No'})`);
+            
+            // Process using the standard packet processing method
             this._processCompletePacket(completePacket);
             
-            log(`✅ Completed packet #${packetId} (${partialPacket.bytesReceived} bytes) - processed successfully`);
+            // Explicitly process the packet as an HLS segment
+            this._processHLSSegment(
+                completePacket.packetId, 
+                completePacket.avData, 
+                completePacket.segmentDuration
+            );
+            
+            // If we have enough segments, generate or update the HLS manifest
+            if (Object.keys(this.segments).length >= 2) {
+                this._updateHLSManifest();
+            }
             
             // Remove from tracking to free memory
             delete this.partialPackets[packetId];
@@ -391,7 +440,7 @@ function startHlsPlayback(hlsUrl) {
         
         return false;
     }
-    
+        
     /**
      * Process packet fragments from stream data directly
      * This method allows processing smaller chunks without requiring the entire packet
@@ -2971,24 +3020,36 @@ function setupPacketHandlerCallbacks() {
     if (!window.packetHandler) return;
     
     window.packetHandler.onHLSReady = (hlsUrl) => {
-        log(`📄 HLS ready for playback: ${hlsUrl}`);
+        log(`📄 HLS manifest ready! URL: ${hlsUrl}`);
         
-        if (!window.player) {
-            initializeHLSPlayer(hlsUrl);
-            
-            // Update UI to reflect fragment count
-            const bufferStatus = document.getElementById('bufferStatus');
-            if (bufferStatus) {
-                bufferStatus.textContent = `${fragmentCounter} fragments`;
+        // Force player initialization
+        if (window.player) {
+            try {
+                window.player.destroy();
+            } catch (e) {
+                // Ignore errors
             }
-            
-            // Update play button
-            updatePlayButton();
-        } else {
-            log(`📄 Player already exists, loading source: ${hlsUrl}`);
-            window.player.loadSource(hlsUrl);
+            window.player = null;
         }
+        
+        // Create a new player
+        window.player = initializeHLSPlayer(hlsUrl);
+        
+        // Update play button state
+        updatePlayButton();
+        
+        // Update UI
+        document.getElementById('playerStatus').textContent = "Ready";
+        document.getElementById('playButton').disabled = false;
     };
+
+    // Force manifest generation after receiving enough packets
+    setInterval(() => {
+        if (window.packetHandler && !window.packetHandler.hlsData && window.packetHandler.packetsReceived > 3) {
+            log("🔄 Forcing HLS manifest generation...");
+            window.packetHandler._generateHLSManifest();
+        }
+    }, 2000);
     
     log("✅ Packet handler callbacks configured");
 }
