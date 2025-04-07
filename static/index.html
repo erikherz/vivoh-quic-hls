@@ -186,6 +186,8 @@ window.segmentBlobUrlMap = new Map();
 let masterPlaylistUrl = null;
 let videoPlaylistUrl = null;
 let fragmentCounter = 0;
+window.streamBuffers = [];
+window.connectionStartTime = Date.now();
 
 window.registerMediaSegment = (trackId, segmentId, data, segmentName) => {
     // Store with both the exact name and the ID-based key
@@ -755,9 +757,9 @@ WebTransportHLSPacketHandler.prototype.disconnect = function() {
 };
 
 /**
- * WebTransportStreamBuffer - Handles buffering and packet assembly from a single WebTransport stream
+ * Enhanced WebTransportStreamBuffer with added debugging and improved packet detection
  */
-class WebTransportStreamBuffer {
+ class WebTransportStreamBuffer {
     constructor(streamId) {
         // Buffer for accumulating partial data from this specific stream
         this.buffer = new Uint8Array(0);
@@ -773,6 +775,9 @@ class WebTransportStreamBuffer {
         this.totalBytesReceived = 0;
         this.validPacketsExtracted = 0;
         this.invalidPacketsRejected = 0;
+        
+        // Debugging: log first chunk contents
+        this.hasLoggedFirstChunk = false;
     }
     
     /**
@@ -783,6 +788,37 @@ class WebTransportStreamBuffer {
     addChunk(chunk) {
         // Convert to Uint8Array if needed
         const data = (chunk instanceof ArrayBuffer) ? new Uint8Array(chunk) : chunk;
+        
+        // Debug: Log first chunk contents in detail to understand the format
+        if (!this.hasLoggedFirstChunk && data.byteLength > 0) {
+            // Log the first 32 bytes (or fewer if not available)
+            const bytesToLog = Math.min(32, data.byteLength);
+            const hexDump = Array.from(data.slice(0, bytesToLog))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+                
+            // Also try to interpret as text for debugging
+            let textView = '';
+            try {
+                textView = new TextDecoder().decode(data.slice(0, bytesToLog));
+                // Replace non-printable characters with dots
+                textView = textView.replace(/[^\x20-\x7E]/g, '.');
+            } catch (e) {
+                textView = '(not text)';
+            }
+            
+            log(`🔍 Stream ${this.streamId} first chunk contents (${bytesToLog} bytes):`);
+            log(`🔍 HEX: ${hexDump}`);
+            log(`🔍 TXT: ${textView}`);
+            
+            // Check if this might be a text protocol (HTTP/WebSocket handshake, etc.)
+            if (textView.includes('HTTP') || textView.includes('GET') || 
+                textView.includes('POST') || textView.includes('WebSocket')) {
+                log(`⚠️ Stream ${this.streamId} appears to contain text protocol data rather than binary media packets`);
+            }
+            
+            this.hasLoggedFirstChunk = true;
+        }
         
         // Update statistics
         this.totalBytesReceived += data.byteLength;
@@ -804,17 +840,27 @@ class WebTransportStreamBuffer {
     }
     
     /**
-     * Extract a complete packet if available
+     * Extract a complete packet if available - Enhanced with better debugging and packet scanning
      * @return {Object|null} - The extracted packet or null if none available
      */
     extractPacket() {
+        // Check if buffer is large enough for header
         if (this.buffer.byteLength < this.HEADER_SIZE) {
-            return null; // Not enough for even the header
+            return null; // Not enough data for even the header
+        }
+
+        // Log buffer details once when it gets big enough
+        if (this.buffer.byteLength >= this.HEADER_SIZE && !this.hasLoggedBufferHeader) {
+            const headerHex = Array.from(this.buffer.slice(0, this.HEADER_SIZE))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+            log(`🔍 Stream ${this.streamId} header bytes: ${headerHex}`);
+            this.hasLoggedBufferHeader = true;
         }
 
         const view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.HEADER_SIZE);
         
-        // Parse header fields with validation
+        // Parse header fields with validation and detailed logging
         try {
             const packetId = view.getUint32(0, false);         // Big endian
             const timestamp = view.getBigUint64(4, false);     // Big endian
@@ -822,13 +868,29 @@ class WebTransportStreamBuffer {
             const segmentDuration = view.getFloat32(16, false);
             const avDataLen = view.getUint32(20, false);
 
-            // Validate header fields before proceeding
-            if (!Number.isFinite(packetId) || packetId < 0 || packetId > this.MAX_VALID_PACKET_ID ||
-                !Number.isFinite(segmentDuration) || segmentDuration <= 0 || segmentDuration > 10 ||
-                !Number.isFinite(avDataLen) || avDataLen <= 0 || avDataLen > this.MAX_PACKET_SIZE) {
-                
-                log(`🚨 Invalid header values: ID=${packetId}, duration=${segmentDuration}, size=${avDataLen}`);
-                // Skip one byte and try again
+            // Log header fields for debugging (only once)
+            if (!this.hasLoggedHeaderParsing) {
+                log(`🔍 Stream ${this.streamId} parsed header: ID=${packetId}, TS=${timestamp}, duration=${duration}, segDuration=${segmentDuration}, avDataLen=${avDataLen}`);
+                this.hasLoggedHeaderParsing = true;
+            }
+
+            // Enhanced validation with specific error messages
+            if (!Number.isFinite(packetId) || packetId < 0 || packetId > this.MAX_VALID_PACKET_ID) {
+                log(`🚨 Invalid packet ID: ${packetId} (must be 0-${this.MAX_VALID_PACKET_ID})`);
+                this.buffer = this.buffer.slice(1); // Skip one byte and try again
+                this.invalidPacketsRejected++;
+                return null;
+            }
+            
+            if (!Number.isFinite(segmentDuration) || segmentDuration <= 0 || segmentDuration > 10) {
+                log(`🚨 Invalid segment duration: ${segmentDuration}s (must be 0-10s)`);
+                this.buffer = this.buffer.slice(1);
+                this.invalidPacketsRejected++;
+                return null;
+            }
+            
+            if (!Number.isFinite(avDataLen) || avDataLen <= 0 || avDataLen > this.MAX_PACKET_SIZE) {
+                log(`🚨 Invalid data length: ${avDataLen} (must be 1-${this.MAX_PACKET_SIZE})`);
                 this.buffer = this.buffer.slice(1);
                 this.invalidPacketsRejected++;
                 return null;
@@ -836,26 +898,47 @@ class WebTransportStreamBuffer {
 
             const totalSize = this.HEADER_SIZE + avDataLen;
 
+            // Check if we have enough data for the complete packet
             if (this.buffer.byteLength < totalSize) {
-                return null; // Wait for more data
+                // Not enough data yet, wait for more
+                if (!this.hasLoggedWaitingForData) {
+                    log(`🔍 Stream ${this.streamId} waiting for more data: have ${this.buffer.byteLength}, need ${totalSize} bytes`);
+                    this.hasLoggedWaitingForData = true;
+                }
+                return null;
             }
 
             // Sync byte check (first byte of MPEG-TS should be 0x47)
             const syncByte = this.buffer[this.HEADER_SIZE];
             if (syncByte !== 0x47) {
                 log(`🚨 Invalid MPEG-TS sync byte. Expected 0x47, got 0x${syncByte.toString(16)}. Discarding byte to resync.`);
-                this.buffer = this.buffer.slice(1);
+                
+                // ENHANCED: Perform a scan for valid sync pattern
+                const scanResult = this._scanForSyncPattern();
+                if (scanResult > 0) {
+                    log(`🔍 Found potential sync pattern at offset ${scanResult}, skipping ahead`);
+                    this.buffer = this.buffer.slice(scanResult);
+                } else {
+                    // Just skip one byte if no pattern found
+                    this.buffer = this.buffer.slice(1);
+                }
+                
                 this.invalidPacketsRejected++;
                 return null;
             }
 
-            // Slice the packet
+            // Extract packet data
             const packet = this.buffer.slice(0, totalSize);
             const avData = packet.slice(this.HEADER_SIZE);
 
             // Remove packet from buffer
             this.buffer = this.buffer.slice(totalSize);
             this.validPacketsExtracted++;
+
+            // Log on first successful packet
+            if (this.validPacketsExtracted === 1) {
+                log(`✅ Stream ${this.streamId} extracted first valid packet: ID=${packetId}, size=${avData.byteLength}`);
+            }
 
             return {
                 packetId,
@@ -865,7 +948,7 @@ class WebTransportStreamBuffer {
                 avData
             };
         } catch (e) {
-            log(`❌ Error extracting packet: ${e.message}`);
+            log(`❌ Stream ${this.streamId} error extracting packet: ${e.message}`);
             // Corrupted data - discard first byte and try again next time
             this.buffer = this.buffer.slice(1);
             this.invalidPacketsRejected++;
@@ -874,23 +957,55 @@ class WebTransportStreamBuffer {
     }
     
     /**
-     * Reset the buffer state
+     * Scan buffer for MPEG-TS sync pattern (0x47 followed by valid header structure)
+     * @private
+     * @returns {number} Offset to the sync pattern or 0 if not found
      */
-    reset() {
-        this.buffer = new Uint8Array(0);
-    }
-    
-    /**
-     * Get current buffer statistics
-     */
-    getStats() {
-        return {
-            streamId: this.streamId,
-            bufferSize: this.buffer.byteLength,
-            totalBytesReceived: this.totalBytesReceived,
-            validPacketsExtracted: this.validPacketsExtracted,
-            invalidPacketsRejected: this.invalidPacketsRejected
-        };
+    _scanForSyncPattern() {
+        // Need at least header size + 1 for sync byte
+        if (this.buffer.byteLength < this.HEADER_SIZE + 1) {
+            return 0;
+        }
+        
+        // Scan for 0x47 sync byte followed by reasonable header values
+        for (let i = 1; i < this.buffer.byteLength - this.HEADER_SIZE; i++) {
+            if (this.buffer[i] === 0x47) {
+                // Check if we could have a valid header at this position
+                // Look back to see if there's enough space for a header before this sync byte
+                if (i >= this.HEADER_SIZE) {
+                    try {
+                        const tempView = new DataView(
+                            this.buffer.buffer, 
+                            this.buffer.byteOffset + (i - this.HEADER_SIZE), 
+                            this.HEADER_SIZE
+                        );
+                        
+                        // Do basic validation of header fields
+                        const packetId = tempView.getUint32(0, false);
+                        const segmentDuration = tempView.getFloat32(16, false);
+                        const avDataLen = tempView.getUint32(20, false);
+                        
+                        // Check if these values look reasonable
+                        if (packetId >= 0 && packetId < this.MAX_VALID_PACKET_ID &&
+                            segmentDuration > 0 && segmentDuration <= 10 &&
+                            avDataLen > 0 && avDataLen < this.MAX_PACKET_SIZE) {
+                            
+                            // This looks like a potential valid header position
+                            log(`🔍 Potential valid header at offset ${i - this.HEADER_SIZE}: ID=${packetId}, segDuration=${segmentDuration}, avDataLen=${avDataLen}`);
+                            return i - this.HEADER_SIZE;
+                        }
+                    } catch (e) {
+                        // Skip errors in validation
+                    }
+                }
+                
+                // Alternative: just return position of the sync byte
+                // Uncomment if we want to skip directly to sync bytes
+                // return i;
+            }
+        }
+        
+        return 0; // No pattern found
     }
     
     /**
@@ -943,12 +1058,34 @@ class WebTransportStreamBuffer {
         result.set(b, a.byteLength);
         return result;
     }
+    
+    /**
+     * Reset the buffer state
+     */
+    reset() {
+        this.buffer = new Uint8Array(0);
+    }
+    
+    /**
+     * Get current buffer statistics
+     */
+    getStats() {
+        return {
+            streamId: this.streamId,
+            bufferSize: this.buffer.byteLength,
+            totalBytesReceived: this.totalBytesReceived,
+            validPacketsExtracted: this.validPacketsExtracted,
+            invalidPacketsRejected: this.invalidPacketsRejected
+        };
+    }
 }
 
 /**
- * Handle a single incoming WebTransport stream
+ * Enhanced function to handle a single incoming WebTransport stream
+ * - Improved debugging and error handling
+ * - Detects stream format issues
  */
-async function handleIncomingStream(stream, packetHandler) {
+ async function handleIncomingStream(stream, packetHandler) {
     // Generate a unique ID for this stream
     const streamId = window.streamCounter;
     
@@ -959,29 +1096,50 @@ async function handleIncomingStream(stream, packetHandler) {
     // Create a dedicated buffer manager for this stream
     const streamBuffer = new WebTransportStreamBuffer(streamId);
     
+    // Track stream performance
+    const streamStartTime = Date.now();
+    let lastProgressTime = streamStartTime;
+    let emptyReadCount = 0;
+    
     try {
         log(`📥 Processing incoming stream #${streamId}`);
         
+        // Process the stream data
         while (!window.disconnectionRequested) {
             const { value, done } = await reader.read();
             
+            // Check if stream has ended
             if (done) {
-                log(`📤 Stream #${streamId} ended`);
+                const runTime = (Date.now() - streamStartTime) / 1000;
+                log(`📤 Stream #${streamId} ended after ${runTime.toFixed(1)}s`);
                 break;
             }
             
+            // Handle empty chunks
             if (!value || value.byteLength === 0) {
+                emptyReadCount++;
+                
+                // Log occasional warnings if we're getting too many empty reads
+                if (emptyReadCount % 50 === 0) {
+                    log(`⚠️ Stream #${streamId} received ${emptyReadCount} empty reads`);
+                }
                 continue;
             }
+            
+            // Reset empty read counter since we got data
+            emptyReadCount = 0;
             
             // Add this chunk to the stream's buffer
             streamBuffer.addChunk(value);
             
             // Extract and process any complete packets
+            let packetsInThisRead = 0;
             let packet;
+            
             while ((packet = streamBuffer.extractPacket()) !== null) {
-                // Process the packet directly with the handler
+                // Process the packet with the handler
                 packetHandler.processValidatedPacket(packet);
+                packetsInThisRead++;
                 
                 // Update UI counter
                 const packetCounter = document.getElementById('packetCounter');
@@ -990,8 +1148,47 @@ async function handleIncomingStream(stream, packetHandler) {
                 }
             }
             
+            // Log progress if we processed packets
+            if (packetsInThisRead > 0) {
+                log(`✅ Stream #${streamId} processed ${packetsInThisRead} packets from last read (${value.byteLength} bytes)`);
+                lastProgressTime = Date.now();
+            } else {
+                // Log if we haven't made progress in a while
+                const timeSinceProgress = Date.now() - lastProgressTime;
+                if (timeSinceProgress > 5000) { // 5 seconds
+                    // Get detailed stats
+                    const stats = streamBuffer.getStats();
+                    
+                    // Log detailed buffer information for debugging
+                    log(`⚠️ Stream #${streamId} no packets found in ${(timeSinceProgress/1000).toFixed(1)}s: Size=${stats.bufferSize}B, Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}`);
+                    
+                    // If buffer is large but we've never extracted a packet, something might be wrong
+                    if (stats.bufferSize > 10000 && stats.validPacketsExtracted === 0) {
+                        // Log the first part of the buffer for debugging
+                        const bufferSample = streamBuffer.buffer.slice(0, Math.min(64, streamBuffer.buffer.byteLength));
+                        const hexSample = Array.from(bufferSample)
+                            .map(b => b.toString(16).padStart(2, '0'))
+                            .join(' ');
+                        
+                        log(`🔍 Stream #${streamId} buffer sample: ${hexSample}`);
+                        
+                        // Try to interpret as text
+                        try {
+                            const textSample = new TextDecoder().decode(bufferSample);
+                            const printableSample = textSample.replace(/[^\x20-\x7E]/g, '.'); // Replace non-printable with dots
+                            log(`🔍 Stream #${streamId} as text: ${printableSample}`);
+                        } catch (e) {
+                            // Ignore text decoding errors
+                        }
+                        
+                        // Only log this once per stream
+                        lastProgressTime = Date.now();
+                    }
+                }
+            }
+            
             // Periodically log buffer stats
-            if (packetHandler.packetsReceived % 50 === 0) {
+            if (packetHandler.packetsReceived % 50 === 0 && packetHandler.packetsReceived > 0) {
                 const stats = streamBuffer.getStats();
                 log(`📊 Stream #${streamId} buffer stats: Size=${stats.bufferSize}B, Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}`);
             }
@@ -1000,17 +1197,553 @@ async function handleIncomingStream(stream, packetHandler) {
         log(`❌ Error in stream #${streamId}: ${error.message}`);
     } finally {
         try {
+            // Release the reader lock
             reader.releaseLock();
+            
+            // Log final stats
+            const stats = streamBuffer.getStats();
+            const runTime = (Date.now() - streamStartTime) / 1000;
+            
+            log(`📊 Stream #${streamId} final stats: Valid=${stats.validPacketsExtracted}, Invalid=${stats.invalidPacketsRejected}, Received=${stats.totalBytesReceived}B, Duration=${runTime.toFixed(1)}s`);
         } catch (e) {
             // Ignore errors during cleanup
         }
         
+        // Remove from active readers
         const index = window.activeReaders.indexOf(reader);
         if (index !== -1) {
             window.activeReaders.splice(index, 1);
         }
         
         log(`🛑 Stream #${streamId} processing completed`);
+    }
+}
+
+/**
+ * Analyzes raw stream data to detect format issues and potential packet boundaries
+ * Can be called when troubleshooting stream parsing problems
+ */
+ function analyzeStreamData(buffer, options = {}) {
+    // Default options
+    const opts = {
+        maxScanBytes: 2048,           // Max bytes to scan
+        sampleSize: 64,               // Sample size for pattern detection
+        patternThreshold: 3,          // Min occurrences to declare a pattern
+        assumedHeaderSize: 24,        // Default header size to try
+        detectHeaderSize: true,       // Try to detect header size
+        searchSyncBytes: true,        // Search for MPEG-TS sync bytes (0x47)
+        showHexDump: true,            // Show hex dump of samples
+        ...options
+    };
+    
+    // Validate input
+    if (!buffer || buffer.byteLength === 0) {
+        log(`⚠️ Stream analysis: Empty buffer`);
+        return;
+    }
+    
+    // Limit scan size
+    const scanSize = Math.min(buffer.byteLength, opts.maxScanBytes);
+    log(`🔍 Analyzing stream data (${buffer.byteLength} bytes, scanning first ${scanSize})`);
+    
+    // Get a view of the buffer to scan
+    const scanBuffer = buffer.slice(0, scanSize);
+    
+    // Basic statistics
+    const stats = {
+        nullBytes: 0,
+        textCharacters: 0,
+        binaryData: 0,
+        potentialSyncBytes: 0
+    };
+    
+    // Simple byte frequency analysis
+    const byteFrequency = new Array(256).fill(0);
+    const patterns = {}; // Store recurring byte patterns
+    
+    // 1. Scan bytes and record statistics
+    for (let i = 0; i < scanBuffer.byteLength; i++) {
+        const byte = scanBuffer[i];
+        byteFrequency[byte]++;
+        
+        // Count byte types
+        if (byte === 0) stats.nullBytes++;
+        else if (byte >= 32 && byte <= 126) stats.textCharacters++; // ASCII printable
+        else stats.binaryData++;
+        
+        // Check for MPEG-TS sync byte (0x47)
+        if (byte === 0x47) stats.potentialSyncBytes++;
+        
+        // Record byte patterns (for header detection)
+        if (i >= opts.sampleSize && opts.detectHeaderSize) {
+            const pattern = scanBuffer.slice(i - opts.sampleSize, i);
+            const patternKey = Array.from(pattern).join(',');
+            patterns[patternKey] = (patterns[patternKey] || 0) + 1;
+        }
+    }
+    
+    // 2. Output basic data type assessment
+    const bytesAnalyzed = scanBuffer.byteLength;
+    const nullPercent = (stats.nullBytes / bytesAnalyzed * 100).toFixed(1);
+    const textPercent = (stats.textCharacters / bytesAnalyzed * 100).toFixed(1);
+    const binaryPercent = (stats.binaryData / bytesAnalyzed * 100).toFixed(1);
+    
+    log(`🔢 Byte composition: ${nullPercent}% null, ${textPercent}% text, ${binaryPercent}% binary`);
+    
+    // 3. Data type classification
+    let dataTypeGuess = 'Unknown';
+    if (textPercent > 60) {
+        dataTypeGuess = 'Text protocol (HTTP, WebSocket, etc)';
+    } else if (binaryPercent > 70) {
+        dataTypeGuess = 'Binary protocol';
+        
+        // Check for common binary format signatures
+        if (scanBuffer[0] === 0x1F && scanBuffer[1] === 0x8B) {
+            dataTypeGuess = 'GZIP compressed data';
+        } else if (scanBuffer[0] === 0x50 && scanBuffer[1] === 0x4B) {
+            dataTypeGuess = 'ZIP compressed data';
+        } else if (stats.potentialSyncBytes > 5) {
+            dataTypeGuess = 'Potential MPEG-TS data';
+        }
+    }
+    
+    log(`🔍 Data type guess: ${dataTypeGuess}`);
+    
+    // 4. Show a hex dump of the first part of the buffer
+    if (opts.showHexDump) {
+        const hexLimit = Math.min(128, scanBuffer.byteLength);
+        let hexDump = '';
+        let textDump = '';
+        
+        for (let i = 0; i < hexLimit; i++) {
+            // Add line breaks every 16 bytes
+            if (i > 0 && i % 16 === 0) {
+                hexDump += '\n';
+                log(`🔍 ${hexDump}  |  ${textDump}`);
+                hexDump = '';
+                textDump = '';
+            }
+            
+            const byte = scanBuffer[i];
+            hexDump += byte.toString(16).padStart(2, '0') + ' ';
+            
+            // For text representation, show printable chars or dots
+            if (byte >= 32 && byte <= 126) {
+                textDump += String.fromCharCode(byte);
+            } else {
+                textDump += '.';
+            }
+        }
+        
+        // Output the last line if there's anything left
+        if (hexDump) {
+            log(`🔍 ${hexDump.padEnd(48, ' ')}  |  ${textDump}`);
+        }
+    }
+    
+    // 5. Pattern detection for potential headers
+    if (opts.detectHeaderSize) {
+        let repeatingPatterns = [];
+        
+        // Find patterns with frequency above threshold
+        for (const [pattern, count] of Object.entries(patterns)) {
+            if (count >= opts.patternThreshold) {
+                repeatingPatterns.push({ pattern, count });
+            }
+        }
+        
+        // Sort by frequency
+        repeatingPatterns.sort((a, b) => b.count - a.count);
+        
+        if (repeatingPatterns.length > 0) {
+            const topPatterns = repeatingPatterns.slice(0, 3);
+            let patternMsg = '📋 Potential repeating patterns detected:\n';
+            
+            for (const {pattern, count} of topPatterns) {
+                patternMsg += `   - Pattern occurs ${count} times (potential header structure)\n`;
+            }
+            
+            log(patternMsg);
+            
+            // Use pattern to guess header size
+            const patternDistance = detectPatternDistance(scanBuffer, 0x47); // Use 0x47 (sync byte) as marker
+            if (patternDistance > 0) {
+                log(`📏 Potential header size: ${patternDistance} bytes (based on 0x47 sync byte pattern)`);
+                
+                if (patternDistance !== opts.assumedHeaderSize) {
+                    log(`⚠️ This differs from the current header size of ${opts.assumedHeaderSize} bytes!`);
+                }
+            }
+        } else {
+            log(`📋 No clear repeating patterns detected`);
+        }
+    }
+    
+    // 6. Search for MPEG-TS sync bytes and potential packet boundaries
+    if (opts.searchSyncBytes) {
+        const syncPositions = [];
+        
+        for (let i = 0; i < scanBuffer.byteLength; i++) {
+            if (scanBuffer[i] === 0x47) {
+                syncPositions.push(i);
+            }
+        }
+        
+        if (syncPositions.length > 1) {
+            log(`🔍 Found ${syncPositions.length} potential sync bytes (0x47)`);
+            
+            // Calculate distances between sync bytes to detect patterns
+            const distances = [];
+            for (let i = 1; i < syncPositions.length; i++) {
+                distances.push(syncPositions[i] - syncPositions[i-1]);
+            }
+            
+            // Count frequency of each distance to detect packet size
+            const distanceFreq = {};
+            for (const dist of distances) {
+                distanceFreq[dist] = (distanceFreq[dist] || 0) + 1;
+            }
+            
+            // Find most common distance (potential packet size)
+            let mostCommonDist = 0;
+            let maxCount = 0;
+            for (const [dist, count] of Object.entries(distanceFreq)) {
+                if (count > maxCount) {
+                    mostCommonDist = parseInt(dist);
+                    maxCount = count;
+                }
+            }
+            
+            if (mostCommonDist > 0 && maxCount >= 3) {
+                log(`📏 Most common distance between sync bytes: ${mostCommonDist} bytes (appeared ${maxCount} times)`);
+                log(`🔍 This suggests a packet size pattern of approximately ${mostCommonDist} bytes`);
+                
+                // Check if this conflicts with our packet handler's expectations
+                const expectedPacketSize = opts.assumedHeaderSize + 188; // Header + MPEG-TS packet
+                if (Math.abs(mostCommonDist - expectedPacketSize) > 10) {
+                    log(`⚠️ Warning: Detected packet size (${mostCommonDist}) differs significantly from expected size (${expectedPacketSize})`);
+                }
+            } else {
+                log(`📏 No clear pattern in sync byte distances detected`);
+            }
+        } else if (syncPositions.length === 1) {
+            log(`🔍 Only one sync byte (0x47) found at position ${syncPositions[0]}`);
+        } else {
+            log(`🔍 No MPEG-TS sync bytes (0x47) found in the scan range`);
+        }
+    }
+    
+    return {
+        dataTypeGuess,
+        syncByteCount: stats.potentialSyncBytes,
+        nullPercent: parseFloat(nullPercent),
+        textPercent: parseFloat(textPercent),
+        binaryPercent: parseFloat(binaryPercent),
+        bytesAnalyzed
+    };
+}
+
+/**
+ * Detect the distance between repeating patterns in a buffer
+ * Useful for guessing header size or packet boundaries
+ */
+function detectPatternDistance(buffer, markerByte) {
+    const positions = [];
+    
+    // Find all occurrences of the marker byte
+    for (let i = 0; i < buffer.byteLength; i++) {
+        if (buffer[i] === markerByte) {
+            positions.push(i);
+        }
+    }
+    
+    if (positions.length < 2) {
+        return 0; // Not enough occurrences to detect pattern
+    }
+    
+    // Calculate distances between consecutive positions
+    const distances = [];
+    for (let i = 1; i < positions.length; i++) {
+        distances.push(positions[i] - positions[i-1]);
+    }
+    
+    // Find the most common distance
+    const distanceFreq = {};
+    for (const dist of distances) {
+        distanceFreq[dist] = (distanceFreq[dist] || 0) + 1;
+    }
+    
+    let mostCommonDist = 0;
+    let maxCount = 0;
+    for (const [dist, count] of Object.entries(distanceFreq)) {
+        if (count > maxCount) {
+            mostCommonDist = parseInt(dist);
+            maxCount = count;
+        }
+    }
+    
+    // Only return if pattern appears multiple times
+    return (maxCount >= 3) ? mostCommonDist : 0;
+}
+
+/**
+ * Diagnostic function to analyze all active streams and report issues
+ * Add this function to debug WebTransport streams in real-time
+ */
+ function diagnoseStreamIssues() {
+    log(`🩺 Running stream diagnostics...`);
+    
+    // Check if we have an active transport
+    if (!window.transport) {
+        log(`❌ No active WebTransport connection`);
+        return;
+    }
+    
+    // Check active readers/streams
+    const activeReaderCount = window.activeReaders?.length || 0;
+    log(`📊 Active streams: ${activeReaderCount}`);
+    
+    // Check packet handler
+    if (!window.packetHandler) {
+        log(`❌ No packet handler initialized`);
+        return;
+    }
+    
+    // Check fragment counter
+    log(`📊 Total fragments: ${window.fragmentCounter || 0}`);
+    
+    // Check if HLS.js is enabled
+    const hlsSupported = !!window.Hls && Hls.isSupported();
+    log(`📊 HLS support: ${hlsSupported ? 'Yes' : 'No'}`);
+    
+    // Check if we have registered any blob URLs
+    const blobUrlCount = window.blobUrlMap?.size || 0;
+    log(`📊 Registered blob URLs: ${blobUrlCount}`);
+    
+    // Check if XHR interception is enabled
+    log(`📊 XHR interception: ${window.xhrInterceptionEnabled ? 'Enabled' : 'Disabled'}`);
+    
+    // Validate packet handler structure
+    const isPacketHandlerValid = validatePacketHandler();
+    if (!isPacketHandlerValid) {
+        log(`❌ Packet handler validation failed`);
+    }
+    
+    // Check for potential protocol mismatches
+    if (activeReaderCount > 0 && window.fragmentCounter === 0) {
+        log(`⚠️ Streams are active but no fragments have been processed`);
+        log(`🔍 This could indicate a protocol mismatch or packet format issue`);
+        
+        // Suggest analyzing buffer contents
+        log(`💡 Try examining raw buffer contents with analyzeStreamData()`);
+    }
+    
+    log(`✅ Stream diagnostics completed`);
+}
+
+/**
+ * Validates the packet handler structure and integrity
+ * @returns {boolean} Whether the packet handler is valid
+ */
+function validatePacketHandler() {
+    if (!window.packetHandler) return false;
+    
+    // Check required methods
+    const requiredMethods = [
+        'processValidatedPacket',
+        '_generateHLSManifest',
+        '_updateHLSManifest',
+        '_generateVideoPlaylist'
+    ];
+    
+    for (const method of requiredMethods) {
+        if (typeof window.packetHandler[method] !== 'function') {
+            log(`❌ Packet handler missing required method: ${method}`);
+            return false;
+        }
+    }
+    
+    // Check required properties
+    if (!window.packetHandler.segments || typeof window.packetHandler.segments !== 'object') {
+        log(`❌ Packet handler missing segments map`);
+        return false;
+    }
+    
+    if (!Array.isArray(window.packetHandler.fragments)) {
+        log(`❌ Packet handler missing fragments array`);
+        return false;
+    }
+    
+    return true;
+}
+
+/**
+ * Get a single stream buffer for analysis
+ * @param {number} streamId - The ID of the stream to analyze
+ * @returns {Uint8Array|null} - The buffer from the stream or null if not found
+ */
+function getStreamBuffer(streamId) {
+    // This is a best-effort function since we don't have direct access to stream buffers
+    // Implement a stream buffer registry if this is useful
+    
+    log(`⚠️ getStreamBuffer() requires a stream buffer registry to be implemented`);
+    return null;
+}
+
+/**
+ * Applies emergency fixes to the packet handler to attempt recovery from stream issues
+ */
+function repairStreamIssues() {
+    log(`🔧 Attempting to repair stream issues...`);
+    
+    // Check if we have a packet handler
+    if (!window.packetHandler) {
+        log(`❌ No packet handler to repair`);
+        return;
+    }
+    
+    // Check stream state
+    let streamBufferWithData = null;
+    let streamBufferSize = 0;
+    
+    // Try to find a stream buffer with data for analysis
+    try {
+        // This would require additional tracking of stream buffers
+        streamBufferWithData = getStreamBuffer();
+    } catch (e) {
+        log(`⚠️ Could not access stream buffers: ${e.message}`);
+    }
+    
+    // Reset the content type expectation
+    log(`🔧 Try adjusting decoder settings...`);
+    
+    // Emergency generation of HLS manifest if needed
+    if (window.fragmentCounter === 0 && !window.packetHandler.hlsData) {
+        log(`🔧 Generating emergency HLS manifest...`);
+        
+        try {
+            window.packetHandler._generateHLSManifest();
+            log(`✅ Emergency HLS manifest generated`);
+        } catch (e) {
+            log(`❌ Failed to generate emergency manifest: ${e.message}`);
+        }
+    }
+    
+    // Repair packet handler state if needed
+    if (!window.masterPlaylistUrl && !window.videoPlaylistUrl) {
+        log(`🔧 Repairing playlist state...`);
+        window.masterPlaylistUrl = null;
+        window.videoPlaylistUrl = null;
+        
+        // Re-enable XHR interception
+        if (!window.xhrInterceptionEnabled) {
+            log(`🔧 Re-enabling XHR interception...`);
+            setupXHRInterception();
+        }
+    }
+    
+    // Check HEADER_SIZE constant - maybe it's wrong
+    log(`🔧 Current header size expectation: 24 bytes`);
+    log(`💡 Consider trying different header sizes (20, 24, 28, 32) if video doesn't play`);
+    
+    // Recommendation
+    log(`✅ Repair attempt completed`);
+    log(`💡 If issues persist, try restarting the connection with a new URL`);
+}
+
+/**
+ * Updates the header parsing mechanism in real-time to try different header sizes
+ * @param {number} newHeaderSize - The new header size to try
+ * @param {boolean} [resetBuffers=true] - Whether to reset all buffers
+ */
+function updateHeaderSize(newHeaderSize, resetBuffers = true) {
+    if (!newHeaderSize || newHeaderSize < 12 || newHeaderSize > 48) {
+        log(`❌ Invalid header size: ${newHeaderSize}`);
+        return;
+    }
+    
+    log(`🔧 Updating header size to ${newHeaderSize} bytes (was 24)`);
+    
+    // Update the HEADER_SIZE property in WebTransportStreamBuffer prototype
+    if (WebTransportStreamBuffer) {
+        WebTransportStreamBuffer.prototype.HEADER_SIZE = newHeaderSize;
+        log(`✅ WebTransportStreamBuffer header size updated to ${newHeaderSize}`);
+    } else {
+        log(`❌ Could not find WebTransportStreamBuffer class`);
+    }
+    
+    // Reset all buffers if requested
+    if (resetBuffers) {
+        log(`🔧 Resetting all stream buffers...`);
+        
+        // This would require tracking all stream buffers
+        // Implement if needed based on your architecture
+    }
+    
+    // Suggestion for testing
+    log(`💡 Try connecting again with the new header size of ${newHeaderSize} bytes`);
+}
+
+/**
+ * Helper function to dump the content of a stream buffer to debug format issues
+ * @param {Uint8Array} buffer - The buffer to dump
+ * @param {Object} options - Dump options
+ */
+function dumpBuffer(buffer, options = {}) {
+    if (!buffer || buffer.byteLength === 0) {
+        log(`⚠️ Empty buffer`);
+        return;
+    }
+    
+    const opts = {
+        maxBytes: 256,
+        bytesPerLine: 16,
+        showText: true,
+        showOffsets: true,
+        ...options
+    };
+    
+    const byteCount = Math.min(buffer.byteLength, opts.maxBytes);
+    log(`📋 Buffer dump (${byteCount} of ${buffer.byteLength} bytes):`);
+    
+    let line = '';
+    let text = '';
+    let offset = '';
+    
+    for (let i = 0; i < byteCount; i++) {
+        // Add line break and print previous line
+        if (i > 0 && i % opts.bytesPerLine === 0) {
+            const output = opts.showOffsets ? `${offset} | ${line}` : line;
+            const fullOutput = opts.showText ? `${output}  |  ${text}` : output;
+            log(fullOutput);
+            line = '';
+            text = '';
+            offset = i.toString(16).padStart(8, '0');
+        }
+        
+        // If this is the start of a line, prepare offset
+        if (i % opts.bytesPerLine === 0) {
+            offset = i.toString(16).padStart(8, '0');
+        }
+        
+        // Format as hex
+        const byte = buffer[i];
+        line += byte.toString(16).padStart(2, '0') + ' ';
+        
+        // Format as text (printable ASCII or dot)
+        if (byte >= 32 && byte <= 126) {
+            text += String.fromCharCode(byte);
+        } else {
+            text += '.';
+        }
+    }
+    
+    // Print the last line if not complete
+    if (line) {
+        const paddedLine = line.padEnd(opts.bytesPerLine * 3, ' ');
+        const output = opts.showOffsets ? `${offset} | ${paddedLine}` : paddedLine;
+        const fullOutput = opts.showText ? `${output}  |  ${text}` : output;
+        log(fullOutput);
     }
 }
 
