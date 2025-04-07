@@ -561,6 +561,9 @@ function startHlsPlayback(hlsUrl) {
         // Create and register blob URL
         const blob = new Blob([segmentData], { type: 'video/mp2t' });
         const blobUrl = URL.createObjectURL(blob);
+        window.blobUrlMap.set(segmentName, segmentData);  // Store raw data
+        window.segmentBlobUrlMap.set(segmentName, blobUrl);  // Store URL
+        log(`✅ Registered segment: ${segmentName} (size: ${segmentData.byteLength} bytes)`);
         
         // Ensure blobUrlMap is defined
         if (!window.blobUrlMap) {
@@ -671,6 +674,8 @@ function startHlsPlayback(hlsUrl) {
         if (typeof startHlsPlayback === 'function') {
             startHlsPlayback(this.hlsUrl);
         }
+        log(`🔍 MASTER PLAYLIST CONTENT: ${masterPlaylist}`);
+        log(`🔍 VIDEO PLAYLIST CONTENT: ${videoPlaylist}`);
     }
 
     /**
@@ -1979,6 +1984,22 @@ function enhanceXHRDebugging() {
             }
         }
         
+        if (this._isMediaSegment && this._segmentName) {
+            log(`🔍 Segment requested: ${this._segmentName}`);
+            
+            if (window.blobUrlMap && window.blobUrlMap.has(this._segmentName)) {
+                const segmentData = window.blobUrlMap.get(this._segmentName);
+                log(`✅ Serving segment: ${this._segmentName} (size: ${segmentData.byteLength} bytes)`);
+                // ...
+            } else {
+                log(`❌ Segment not found: ${this._segmentName}`);
+                // Log available segments
+                if (window.blobUrlMap) {
+                    log(`🔍 Available segments: ${Array.from(window.blobUrlMap.keys()).filter(k => k.includes('.ts')).join(', ')}`);
+                }
+            }
+        }
+
         // Call the original send method
         return originalXHRSend.call(this, body);
     };
@@ -2660,6 +2681,8 @@ function respondWith404(xhr) {
                         break;
                 }
             }
+            log(`⚠️ HLS.js error: ${data.type}, ${data.details}, fatal: ${data.fatal}`);
+            console.error("Error details:", data);
         });
         
         // Set up periodic buffer state monitoring
@@ -3159,7 +3182,8 @@ function enhanceXHRDebugging() {
         originalXHRSend.call(this, body);
         
     };
-    
+    log(`🔍 Segment requested: ${segmentName}, found in blob map: ${blobUrlMap.has(segmentName)}`);
+
     log(`✅ Enhanced XHR debugging completed`);
     return true;
 }
